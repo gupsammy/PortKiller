@@ -19,3 +19,6 @@
 .macport.json
 
 PROJECT_INDEX.json
+
+# Local documentation (generated/working notes)
+docs/
