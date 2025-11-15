@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use log::{error, warn};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::unistd::{Pid, getpgid};
 use serde::{Deserialize, Serialize};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -26,7 +26,10 @@ const MENU_ID_KILL_ALL: &str = "kill_all";
 const MENU_ID_QUIT: &str = "quit";
 const MENU_ID_EDIT_CONFIG: &str = "edit_config";
 const MENU_ID_PROCESS_PREFIX: &str = "process_";
+const MENU_ID_DOCKER_STOP_PREFIX: &str = "docker_stop_";
+const MENU_ID_BREW_STOP_PREFIX: &str = "brew_stop_";
 const MENU_ID_EMPTY: &str = "empty";
+const MENU_ID_SNOOZE_30M: &str = "snooze_30m";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Config {
@@ -35,6 +38,10 @@ struct Config {
     inactive_color: (u8, u8, u8),
     #[serde(default = "default_active_color")]
     active_color: (u8, u8, u8),
+    #[serde(default = "default_confirm_list")]
+    confirm_before_kill: Vec<String>,
+    #[serde(default = "default_notifications_enabled")]
+    notifications_enabled: bool,
 }
 
 fn default_inactive_color() -> (u8, u8, u8) {
@@ -43,6 +50,21 @@ fn default_inactive_color() -> (u8, u8, u8) {
 
 fn default_active_color() -> (u8, u8, u8) {
     (255, 69, 58) // Red - SF Symbols system red color
+}
+
+fn default_confirm_list() -> Vec<String> {
+    vec![
+        "postgres".into(),
+        "postgresql".into(),
+        "mysqld".into(),
+        "redis".into(),
+        "redis-server".into(),
+        "mongod".into(),
+    ]
+}
+
+fn default_notifications_enabled() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -63,6 +85,8 @@ impl Default for Config {
             ],
             inactive_color: default_inactive_color(),
             active_color: default_active_color(),
+            confirm_before_kill: default_confirm_list(),
+            notifications_enabled: default_notifications_enabled(),
         }
     }
 }
@@ -76,10 +100,8 @@ fn load_or_create_config() -> Result<Config> {
     let path = get_config_path();
 
     if path.exists() {
-        let content = fs::read_to_string(&path)
-            .context("failed to read config file")?;
-        serde_json::from_str(&content)
-            .context("failed to parse config file")
+        let content = fs::read_to_string(&path).context("failed to read config file")?;
+        serde_json::from_str(&content).context("failed to parse config file")
     } else {
         let config = Config::default();
         save_config(&config)?;
@@ -89,10 +111,8 @@ fn load_or_create_config() -> Result<Config> {
 
 fn save_config(config: &Config) -> Result<()> {
     let path = get_config_path();
-    let content = serde_json::to_string_pretty(config)
-        .context("failed to serialize config")?;
-    fs::write(&path, content)
-        .context("failed to write config file")?;
+    let content = serde_json::to_string_pretty(config).context("failed to serialize config")?;
+    fs::write(&path, content).context("failed to write config file")?;
     Ok(())
 }
 
@@ -101,18 +121,30 @@ fn main() -> Result<()> {
 
     let config = load_or_create_config().context("failed to load configuration")?;
 
+    let mut state = AppState {
+        processes: Vec::new(),
+        last_feedback: None,
+        config: config.clone(),
+        project_cache: HashMap::new(),
+        docker_port_map: HashMap::new(),
+        confirm_pending: HashMap::new(),
+        snooze_until: None,
+    };
+
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("failed to create event loop")?;
     let proxy = event_loop.create_proxy();
     let (kill_tx, kill_rx) = crossbeam_channel::unbounded();
+    let (ops_tx, ops_rx) = crossbeam_channel::unbounded();
 
     let _monitor_thread = spawn_monitor_thread(proxy.clone(), config.clone());
     let _menu_thread = spawn_menu_listener(proxy.clone());
     let _kill_worker = spawn_kill_worker(kill_rx, proxy.clone());
+    let _ops_worker = spawn_ops_worker(ops_rx, proxy.clone());
 
     let icon = create_icon(config.inactive_color).context("failed to create tray icon image")?;
-    let initial_menu = build_menu(&[]).context("failed to build initial menu")?;
+    let initial_menu = build_menu_with_context(&state).context("failed to build initial menu")?;
     let tray_icon = TrayIconBuilder::new()
         .with_icon(icon)
         .with_menu(Box::new(initial_menu))
@@ -123,13 +155,9 @@ fn main() -> Result<()> {
         .set_visible(true)
         .context("failed to show tray icon")?;
 
-    let mut state = AppState {
-        processes: Vec::new(),
-        last_feedback: None,
-        config: config.clone(),
-    };
     update_tray_display(&tray_icon, &state);
     let mut kill_sender: Option<Sender<KillCommand>> = Some(kill_tx);
+    let mut ops_sender: Option<Sender<OpsCommand>> = Some(ops_tx);
 
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
@@ -138,18 +166,22 @@ fn main() -> Result<()> {
         }
         Event::UserEvent(user_event) => match user_event {
             UserEvent::ProcessesUpdated(processes) => {
+                let prev = std::mem::take(&mut state.processes);
                 state.processes = processes;
-                sync_menu(&tray_icon, &state.processes);
+                // Refresh docker port map when we have listeners
+                state.docker_port_map = query_docker_port_map().unwrap_or_default();
+                // Derive project info in best-effort mode
+                refresh_projects_for(&mut state);
+                // Notifications on change
+                maybe_notify_changes(&state, &prev);
+                sync_menu_with_context(&tray_icon, &state);
                 update_tray_display(&tray_icon, &state);
             }
             UserEvent::MenuAction(action) => match action {
                 MenuAction::EditConfig => {
                     let config_path = get_config_path();
                     let path_str = config_path.to_string_lossy().to_string();
-                    let _ = Command::new("open")
-                        .arg("-t")
-                        .arg(&path_str)
-                        .spawn();
+                    let _ = Command::new("open").arg("-t").arg(&path_str).spawn();
                     state.last_feedback = Some(KillFeedback::info(format!(
                         "Opened config file: {}",
                         path_str
@@ -158,6 +190,31 @@ fn main() -> Result<()> {
                 }
                 MenuAction::KillPid { pid, .. } => {
                     if let Some(target) = describe_pid(pid, &state.processes) {
+                        // confirmation gate if matches patterns
+                        if requires_confirmation(&target.label, &state.config.confirm_before_kill) {
+                            let now = Instant::now();
+                            if let Some(ts) = state.confirm_pending.get(&pid) {
+                                if now.duration_since(*ts) <= Duration::from_secs(5) {
+                                    state.confirm_pending.remove(&pid);
+                                } else {
+                                    state.confirm_pending.insert(pid, now);
+                                    state.last_feedback = Some(KillFeedback::warning(format!(
+                                        "Confirm kill: click again to terminate {} (PID {}).",
+                                        target.label, target.pid
+                                    )));
+                                    update_tray_display(&tray_icon, &state);
+                                    return;
+                                }
+                            } else {
+                                state.confirm_pending.insert(pid, now);
+                                state.last_feedback = Some(KillFeedback::warning(format!(
+                                    "Confirm kill: click again to terminate {} (PID {}).",
+                                    target.label, target.pid
+                                )));
+                                update_tray_display(&tray_icon, &state);
+                                return;
+                            }
+                        }
                         if let Some(sender) = kill_sender.as_ref() {
                             if let Err(err) = sender.send(KillCommand::KillPid(target)) {
                                 let feedback = KillFeedback::error(format!(
@@ -212,6 +269,23 @@ fn main() -> Result<()> {
                 MenuAction::Quit => {
                     event_loop.exit();
                 }
+                MenuAction::DockerStop { container } => {
+                    if let Some(sender) = ops_sender.as_ref() {
+                        let _ = sender.send(OpsCommand::DockerStop { container });
+                    }
+                }
+                MenuAction::BrewStop { service } => {
+                    if let Some(sender) = ops_sender.as_ref() {
+                        let _ = sender.send(OpsCommand::BrewStop { service });
+                    }
+                }
+                MenuAction::Snooze30m => {
+                    state.snooze_until = Some(Instant::now() + Duration::from_secs(30 * 60));
+                    state.last_feedback = Some(KillFeedback::info(
+                        "Notifications snoozed for 30 minutes.".into(),
+                    ));
+                    update_tray_display(&tray_icon, &state);
+                }
             },
             UserEvent::KillFeedback(feedback) => {
                 state.last_feedback = Some(feedback);
@@ -225,6 +299,7 @@ fn main() -> Result<()> {
         },
         Event::LoopExiting => {
             kill_sender.take();
+            ops_sender.take();
         }
         _ => {}
     });
@@ -233,9 +308,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn spawn_monitor_thread(proxy: EventLoopProxy<UserEvent>, config: Config) -> thread::JoinHandle<()> {
+fn spawn_monitor_thread(
+    proxy: EventLoopProxy<UserEvent>,
+    config: Config,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut previous: Vec<ProcessInfo> = Vec::new();
+        let mut sleep_interval = POLL_INTERVAL;
         loop {
             match scan_ports(&config.port_ranges) {
                 Ok(mut processes) => {
@@ -248,6 +327,11 @@ fn spawn_monitor_thread(proxy: EventLoopProxy<UserEvent>, config: Config) -> thr
                         {
                             break;
                         }
+                        // Speed up next cycle after change
+                        sleep_interval = Duration::from_millis(500);
+                    } else {
+                        // Back to normal interval when stable
+                        sleep_interval = POLL_INTERVAL;
                     }
                 }
                 Err(err) => {
@@ -257,7 +341,7 @@ fn spawn_monitor_thread(proxy: EventLoopProxy<UserEvent>, config: Config) -> thr
                     }
                 }
             }
-            thread::sleep(POLL_INTERVAL);
+            thread::sleep(sleep_interval);
         }
     })
 }
@@ -288,6 +372,30 @@ fn spawn_kill_worker(
             };
             if !should_continue {
                 break;
+            }
+        }
+    })
+}
+
+fn spawn_ops_worker(
+    rx: Receiver<OpsCommand>,
+    proxy: EventLoopProxy<UserEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for command in rx.iter() {
+            match command {
+                OpsCommand::DockerStop { container } => {
+                    let feedback = run_docker_stop(&container);
+                    if proxy.send_event(UserEvent::KillFeedback(feedback)).is_err() {
+                        break;
+                    }
+                }
+                OpsCommand::BrewStop { service } => {
+                    let feedback = run_brew_stop(&service);
+                    if proxy.send_event(UserEvent::KillFeedback(feedback)).is_err() {
+                        break;
+                    }
+                }
             }
         }
     })
@@ -396,37 +504,74 @@ fn handle_batch_kill(proxy: &EventLoopProxy<UserEvent>, targets: Vec<KillTarget>
 fn terminate_pid(pid_raw: i32) -> KillOutcome {
     let pid = Pid::from_raw(pid_raw);
 
+    // Ensure the PID exists
     match kill(pid, None) {
         Err(Errno::ESRCH) => return KillOutcome::AlreadyExited,
         Err(err) => return KillOutcome::Failed(err),
         Ok(()) => {}
     }
 
+    let mut last_perm_denied = false;
+    let mut tried_group = false;
+
+    // Prefer process group termination first
+    if let Ok(pgid) = getpgid(Some(pid)) {
+        let raw = pgid.as_raw();
+        if raw > 0 {
+            tried_group = true;
+            let gpid = Pid::from_raw(-raw);
+            match kill(gpid, Signal::SIGTERM) {
+                Ok(()) => {}
+                Err(Errno::ESRCH) => {}
+                Err(Errno::EPERM) => last_perm_denied = true,
+                Err(err) => return KillOutcome::Failed(err),
+            }
+            match wait_for_exit(pid, SIGTERM_GRACE) {
+                Ok(true) => return KillOutcome::Success,
+                Ok(false) => {}
+                Err(err) => return KillOutcome::Failed(err),
+            }
+            match kill(gpid, Signal::SIGKILL) {
+                Ok(()) => {}
+                Err(Errno::ESRCH) => {}
+                Err(Errno::EPERM) => last_perm_denied = true,
+                Err(err) => return KillOutcome::Failed(err),
+            }
+            match wait_for_exit(pid, SIGKILL_GRACE) {
+                Ok(true) => return KillOutcome::Success,
+                Ok(false) => {}
+                Err(err) => return KillOutcome::Failed(err),
+            }
+        }
+    }
+
+    // Fallback to targeting the single PID
     match kill(pid, Signal::SIGTERM) {
         Ok(()) => {}
         Err(Errno::ESRCH) => return KillOutcome::AlreadyExited,
-        Err(Errno::EPERM) => return KillOutcome::PermissionDenied,
+        Err(Errno::EPERM) => last_perm_denied = true,
         Err(err) => return KillOutcome::Failed(err),
     }
-
     match wait_for_exit(pid, SIGTERM_GRACE) {
         Ok(true) => return KillOutcome::Success,
         Ok(false) => {}
-        Err(Errno::EPERM) => return KillOutcome::PermissionDenied,
         Err(err) => return KillOutcome::Failed(err),
     }
-
     match kill(pid, Signal::SIGKILL) {
         Ok(()) => {}
         Err(Errno::ESRCH) => return KillOutcome::Success,
-        Err(Errno::EPERM) => return KillOutcome::PermissionDenied,
+        Err(Errno::EPERM) => last_perm_denied = true,
         Err(err) => return KillOutcome::Failed(err),
     }
-
     match wait_for_exit(pid, SIGKILL_GRACE) {
         Ok(true) => KillOutcome::Success,
-        Ok(false) => KillOutcome::TimedOut,
-        Err(Errno::EPERM) => KillOutcome::PermissionDenied,
+        Ok(false) => {
+            if tried_group && last_perm_denied {
+                KillOutcome::PermissionDenied
+            } else {
+                KillOutcome::TimedOut
+            }
+        }
         Err(err) => KillOutcome::Failed(err),
     }
 }
@@ -448,26 +593,55 @@ fn wait_for_exit(pid: Pid, timeout: Duration) -> Result<bool, Errno> {
 }
 
 fn scan_ports(port_ranges: &[(u16, u16)]) -> Result<Vec<ProcessInfo>> {
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
-    let mut command_cache: HashMap<i32, String> = HashMap::new();
+    fn in_ranges(port: u16, ranges: &[(u16, u16)]) -> bool {
+        ranges.iter().any(|(s, e)| port >= *s && port <= *e)
+    }
 
-    for &(start, end) in port_ranges {
-        for port in start..=end {
-            let pids = query_port(port)?;
-            for pid in pids {
-                if !seen.insert((port, pid)) {
-                    continue;
-                }
-                let command = command_cache
-                    .entry(pid)
-                    .or_insert_with(|| resolve_command(pid));
-                results.push(ProcessInfo {
-                    port,
-                    pid,
-                    command: command.clone(),
-                });
+    let output = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-FpcnPT"])
+        .output()
+        .context("failed to execute lsof sweep")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "lsof sweep failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_pid: Option<i32> = None;
+    let mut current_cmd: Option<String> = None;
+    let mut results: Vec<ProcessInfo> = Vec::new();
+    let mut seen: HashSet<(u16, i32)> = HashSet::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (tag, val) = line.split_at(1);
+        match tag {
+            "p" => {
+                current_pid = val.trim().parse::<i32>().ok();
+                current_cmd = None;
             }
+            "c" => {
+                current_cmd = Some(val.trim().to_string());
+            }
+            "n" => {
+                if let (Some(pid), Some(cmd)) = (current_pid, current_cmd.as_ref()) {
+                    if let Some(port) = parse_port_from_lsof(val.trim()) {
+                        if in_ranges(port, port_ranges) && seen.insert((port, pid)) {
+                            results.push(ProcessInfo {
+                                port,
+                                pid,
+                                command: cmd.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -475,60 +649,35 @@ fn scan_ports(port_ranges: &[(u16, u16)]) -> Result<Vec<ProcessInfo>> {
     Ok(results)
 }
 
-fn query_port(port: u16) -> Result<Vec<i32>> {
-    let output = Command::new("lsof")
-        .args(["-ti", &format!(":{}", port), "-sTCP:LISTEN"])
-        .output()
-        .with_context(|| format!("failed to execute lsof for port {}", port))?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut pids = Vec::new();
-        for line in stdout.lines() {
-            if let Ok(pid) = line.trim().parse::<i32>() {
-                pids.push(pid);
-            }
-        }
-        Ok(pids)
-    } else if output.status.code() == Some(1) && output.stdout.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Err(anyhow!(
-            "lsof reported error for port {}: {}",
-            port,
-            String::from_utf8_lossy(&output.stderr)
-        ))
+// Extract a port number from an lsof name field.
+// Handles "*:3000", "127.0.0.1:5173", and "[::1]:8000".
+fn parse_port_from_lsof(name: &str) -> Option<u16> {
+    if name.contains("->") {
+        return None;
     }
-}
-
-fn resolve_command(pid: i32) -> String {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if command.is_empty() {
-                format!("pid {}", pid)
-            } else {
-                command
-            }
-        }
-        Ok(output) => {
-            warn!(
-                "ps failed for pid {}: {}",
-                pid,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            format!("pid {}", pid)
-        }
-        Err(err) => {
-            warn!("ps execution error for pid {}: {}", pid, err);
-            format!("pid {}", pid)
+    let mut digits = String::new();
+    for ch in name.chars().rev() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if ch == ':' {
+            break;
+        } else if ch == ']' {
+            // IPv6 end bracket; continue to previous ':'
+            continue;
+        } else {
+            return None;
         }
     }
+    if digits.is_empty() {
+        return None;
+    }
+    digits = digits.chars().rev().collect();
+    digits.parse::<u16>().ok()
 }
+
+// query_port removed with single-pass sweep
+
+// resolve_command removed with single-pass sweep
 
 fn parse_menu_action(id: &MenuId) -> Option<MenuAction> {
     let raw = id.as_ref();
@@ -538,6 +687,16 @@ fn parse_menu_action(id: &MenuId) -> Option<MenuAction> {
         Some(MenuAction::Quit)
     } else if raw == MENU_ID_EDIT_CONFIG {
         Some(MenuAction::EditConfig)
+    } else if raw == MENU_ID_SNOOZE_30M {
+        Some(MenuAction::Snooze30m)
+    } else if let Some(rest) = raw.strip_prefix(MENU_ID_DOCKER_STOP_PREFIX) {
+        Some(MenuAction::DockerStop {
+            container: rest.to_string(),
+        })
+    } else if let Some(rest) = raw.strip_prefix(MENU_ID_BREW_STOP_PREFIX) {
+        Some(MenuAction::BrewStop {
+            service: rest.to_string(),
+        })
     } else if let Some(remainder) = raw.strip_prefix(MENU_ID_PROCESS_PREFIX) {
         let mut parts = remainder.split('_');
         let pid = parts.next()?.parse::<i32>().ok()?;
@@ -619,33 +778,76 @@ fn format_command_label(command: &str, ports: &[u16]) -> String {
     label
 }
 
-fn build_menu(processes: &[ProcessInfo]) -> Result<Menu> {
+fn build_menu_with_context(state: &AppState) -> Result<Menu> {
     let menu = Menu::new();
+    let processes = &state.processes;
     if processes.is_empty() {
         let item = MenuItem::with_id(MENU_ID_EMPTY, "No dev ports listening", false, None);
         menu.append(&item)?;
     } else {
-        for process in processes {
-            let label = format!(
-                "Kill {} (PID {}, port {})",
-                process.command, process.pid, process.port
-            );
-            let item = MenuItem::with_id(
-                MenuId::new(process_menu_id(process.pid, process.port)),
-                label,
-                true,
+        // Group by project name
+        let mut by_project: BTreeMap<String, Vec<&ProcessInfo>> = BTreeMap::new();
+        for p in processes {
+            let key = state
+                .project_cache
+                .get(&p.pid)
+                .map(|pi| pi.name.clone())
+                .unwrap_or_else(|| "(unknown project)".to_string());
+            by_project.entry(key).or_default().push(p);
+        }
+
+        let mut total = 0usize;
+        for (project, items) in by_project {
+            let header = MenuItem::with_id(
+                &format!("header_{}", project),
+                &format!("— {} —", project),
+                false,
                 None,
             );
-            menu.append(&item)?;
+            menu.append(&header)?;
+            for process in items {
+                total += 1;
+                let label = format!(
+                    "Kill {} (PID {}, port {})",
+                    process.command, process.pid, process.port
+                );
+                let item = MenuItem::with_id(
+                    MenuId::new(process_menu_id(process.pid, process.port)),
+                    label,
+                    true,
+                    None,
+                );
+                menu.append(&item)?;
+
+                // Docker-aware alternative
+                if let Some(dc) = state.docker_port_map.get(&process.port) {
+                    let dlabel = format!("Stop container {} (port {})", dc.name, process.port);
+                    let did = format!("{}{}", MENU_ID_DOCKER_STOP_PREFIX, dc.name);
+                    let ditem = MenuItem::with_id(&did, &dlabel, true, None);
+                    menu.append(&ditem)?;
+                }
+
+                // Brew-aware heuristic
+                if let Some(service) = map_brew_service_from_cmd(&process.command) {
+                    let blabel = format!("Stop via brew {}", service);
+                    let bid = format!("{}{}", MENU_ID_BREW_STOP_PREFIX, service);
+                    let bitem = MenuItem::with_id(&bid, &blabel, true, None);
+                    menu.append(&bitem)?;
+                }
+            }
+            menu.append(&PredefinedMenuItem::separator())?;
         }
-        menu.append(&PredefinedMenuItem::separator())?;
-        let kill_all_label = format!("Kill all ({})", processes.len());
+
+        let kill_all_label = format!("Kill all ({})", total);
         let kill_all_item = MenuItem::with_id(MENU_ID_KILL_ALL, kill_all_label, true, None);
         menu.append(&kill_all_item)?;
     }
 
     menu.append(&PredefinedMenuItem::separator())?;
-    let edit_config_item = MenuItem::with_id(MENU_ID_EDIT_CONFIG, "Edit Configuration...", true, None);
+    let snooze_item = MenuItem::with_id(MENU_ID_SNOOZE_30M, "Snooze notifications 30m", true, None);
+    menu.append(&snooze_item)?;
+    let edit_config_item =
+        MenuItem::with_id(MENU_ID_EDIT_CONFIG, "Edit Configuration...", true, None);
     menu.append(&edit_config_item)?;
     let quit_item = MenuItem::with_id(MENU_ID_QUIT, "Quit", true, None);
     menu.append(&quit_item)?;
@@ -656,17 +858,14 @@ fn process_menu_id(pid: i32, port: u16) -> MenuId {
     MenuId::new(format!("{}{}_{}", MENU_ID_PROCESS_PREFIX, pid, port))
 }
 
-fn sync_menu(tray_icon: &TrayIcon, processes: &[ProcessInfo]) {
-    match build_menu(processes) {
+fn sync_menu_with_context(tray_icon: &TrayIcon, state: &AppState) {
+    match build_menu_with_context(state) {
         Ok(menu) => tray_icon.set_menu(Some(Box::new(menu))),
         Err(err) => error!("Failed to rebuild menu: {}", err),
     }
 }
 
-fn update_tray_display(
-    tray_icon: &TrayIcon,
-    state: &AppState,
-) {
+fn update_tray_display(tray_icon: &TrayIcon, state: &AppState) {
     // Update icon color based on whether ports are active
     let color = if state.processes.is_empty() {
         state.config.inactive_color
@@ -682,6 +881,192 @@ fn update_tray_display(
     if let Err(err) = tray_icon.set_tooltip(Some(tooltip.as_str())) {
         error!("Failed to update tooltip: {}", err);
     }
+}
+
+fn requires_confirmation(label: &str, patterns: &[String]) -> bool {
+    let l = label.to_lowercase();
+    patterns.iter().any(|p| l.contains(&p.to_lowercase()))
+}
+
+fn refresh_projects_for(state: &mut AppState) {
+    let mut missing: HashSet<i32> = HashSet::new();
+    for p in &state.processes {
+        if !state.project_cache.contains_key(&p.pid) {
+            missing.insert(p.pid);
+        }
+    }
+    for pid in missing {
+        if let Some(info) = resolve_project_info(pid) {
+            state.project_cache.insert(pid, info);
+        }
+    }
+}
+
+fn resolve_project_info(pid: i32) -> Option<ProjectInfo> {
+    // Get cwd via lsof -a -p <pid> -d cwd -Fn
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut cwd: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix('n') {
+            cwd = Some(rest.to_string());
+            break;
+        }
+    }
+    let cwd = cwd?;
+    let path = PathBuf::from(cwd.clone());
+    // Try git root
+    let git = Command::new("git")
+        .args(["-C", &cwd, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok();
+    let name = if let Some(gitout) = git {
+        if gitout.status.success() {
+            let root = String::from_utf8_lossy(&gitout.stdout).trim().to_string();
+            PathBuf::from(root)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "(unknown)".into())
+                })
+        } else {
+            path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "(unknown)".into())
+        }
+    } else {
+        path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "(unknown)".into())
+    };
+    Some(ProjectInfo { name, path })
+}
+
+fn query_docker_port_map() -> Result<HashMap<u16, DockerContainerInfo>> {
+    let mut map = HashMap::new();
+    let out = Command::new("docker")
+        .args(["ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Ports}}"])
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => return Ok(map),
+    };
+    if !out.status.success() {
+        return Ok(map);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let id = parts[0].to_string();
+        let name = parts[1].to_string();
+        let ports = parts[2];
+        // PORTS usually like: 0.0.0.0:5432->5432/tcp, :::5432->5432/tcp
+        for seg in ports.split(',') {
+            let seg = seg.trim();
+            if let Some((left, _right)) = seg.split_once("->") {
+                if let Some((_, host)) = left.rsplit_once(':') {
+                    if let Ok(p) = host.parse::<u16>() {
+                        map.insert(
+                            p,
+                            DockerContainerInfo {
+                                name: name.clone(),
+                                id: id.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn map_brew_service_from_cmd(cmd: &str) -> Option<String> {
+    let lc = cmd.to_lowercase();
+    if lc.contains("redis") {
+        return Some("redis".into());
+    }
+    if lc.contains("postgres") {
+        return Some("postgresql".into());
+    }
+    if lc.contains("mysqld") || lc.contains("mysql") {
+        return Some("mysql".into());
+    }
+    if lc.contains("mongod") {
+        return Some("mongodb-community".into());
+    }
+    None
+}
+
+fn run_docker_stop(container: &str) -> KillFeedback {
+    let res = Command::new("docker").args(["stop", container]).output();
+    match res {
+        Ok(out) if out.status.success() => {
+            KillFeedback::info(format!("Stopped container {}.", container))
+        }
+        Ok(out) => KillFeedback::error(format!(
+            "Failed to stop container {}: {}",
+            container,
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(err) => KillFeedback::error(format!("docker stop error: {}", err)),
+    }
+}
+
+fn run_brew_stop(service: &str) -> KillFeedback {
+    let res = Command::new("brew")
+        .args(["services", "stop", service])
+        .output();
+    match res {
+        Ok(out) if out.status.success() => {
+            KillFeedback::info(format!("Stopped brew service {}.", service))
+        }
+        Ok(out) => KillFeedback::error(format!(
+            "Failed to stop brew service {}: {}",
+            service,
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Err(err) => KillFeedback::error(format!("brew services error: {}", err)),
+    }
+}
+
+fn maybe_notify_changes(state: &AppState, prev: &Vec<ProcessInfo>) {
+    if !state.config.notifications_enabled {
+        return;
+    }
+    if let Some(until) = state.snooze_until {
+        if Instant::now() < until {
+            return;
+        }
+    }
+    let prev_ports: HashSet<u16> = prev.iter().map(|p| p.port).collect();
+    let curr_ports: HashSet<u16> = state.processes.iter().map(|p| p.port).collect();
+    let added: Vec<u16> = curr_ports.difference(&prev_ports).copied().collect();
+    let removed: Vec<u16> = prev_ports.difference(&curr_ports).copied().collect();
+    if !added.is_empty() {
+        notify(&format!("Ports now listening: {:?}", added));
+    }
+    if !removed.is_empty() {
+        notify(&format!("Ports freed: {:?}", removed));
+    }
+}
+
+fn notify(message: &str) {
+    // Best-effort macOS notification via AppleScript; ignores errors
+    let msg = message.replace('"', "'");
+    let script = format!("display notification \"{}\" with title \"Macport\"", msg);
+    let _ = Command::new("osascript").args(["-e", &script]).spawn();
 }
 
 fn build_tooltip(processes: &[ProcessInfo], feedback: Option<&KillFeedback>) -> String {
@@ -790,6 +1175,9 @@ enum MenuAction {
     KillPid { pid: i32 },
     KillAll,
     EditConfig,
+    DockerStop { container: String },
+    BrewStop { service: String },
+    Snooze30m,
     Quit,
 }
 
@@ -797,6 +1185,12 @@ enum MenuAction {
 enum KillCommand {
     KillPid(KillTarget),
     KillAll(Vec<KillTarget>),
+}
+
+#[derive(Clone, Debug)]
+enum OpsCommand {
+    DockerStop { container: String },
+    BrewStop { service: String },
 }
 
 #[derive(Clone, Debug)]
@@ -841,6 +1235,10 @@ struct AppState {
     processes: Vec<ProcessInfo>,
     last_feedback: Option<KillFeedback>,
     config: Config,
+    project_cache: HashMap<i32, ProjectInfo>,
+    docker_port_map: HashMap<u16, DockerContainerInfo>,
+    confirm_pending: HashMap<i32, Instant>,
+    snooze_until: Option<Instant>,
 }
 
 impl Default for AppState {
@@ -849,6 +1247,10 @@ impl Default for AppState {
             processes: Vec::new(),
             last_feedback: None,
             config: Config::default(),
+            project_cache: HashMap::new(),
+            docker_port_map: HashMap::new(),
+            confirm_pending: HashMap::new(),
+            snooze_until: None,
         }
     }
 }
@@ -860,4 +1262,16 @@ enum KillOutcome {
     PermissionDenied,
     TimedOut,
     Failed(Errno),
+}
+
+#[derive(Clone, Debug)]
+struct ProjectInfo {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct DockerContainerInfo {
+    name: String,
+    id: String,
 }
