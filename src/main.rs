@@ -274,12 +274,17 @@ fn spawn_monitor_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut previous: Vec<ProcessInfo> = Vec::new();
-        let mut sleep_interval = POLL_INTERVAL;
         loop {
+            let scan_start = std::time::Instant::now();
             match scan_ports(&config.port_ranges) {
                 Ok(mut processes) => {
+                    let scan_duration = scan_start.elapsed();
                     processes.sort();
                     if processes != previous {
+                        log::debug!(
+                            "Change detected (scan took {:?}). Polling immediately for rapid changes.",
+                            scan_duration
+                        );
                         previous = processes.clone();
                         if proxy
                             .send_event(UserEvent::ProcessesUpdated(processes))
@@ -287,11 +292,12 @@ fn spawn_monitor_thread(
                         {
                             break;
                         }
-                        // Speed up next cycle after change
-                        sleep_interval = Duration::from_millis(500);
+                        // Poll immediately to catch rapid changes (0ms delay)
+                        continue;
                     } else {
+                        log::trace!("No change (scan took {:?}). Sleeping {}s.", scan_duration, POLL_INTERVAL.as_secs());
                         // Back to normal interval when stable
-                        sleep_interval = POLL_INTERVAL;
+                        thread::sleep(POLL_INTERVAL);
                     }
                 }
                 Err(err) => {
@@ -299,9 +305,9 @@ fn spawn_monitor_thread(
                     if proxy.send_event(UserEvent::MonitorError(message)).is_err() {
                         break;
                     }
+                    thread::sleep(POLL_INTERVAL);
                 }
             }
-            thread::sleep(sleep_interval);
         }
     })
 }
