@@ -1,0 +1,21 @@
+#!/bin/bash
+# Pre-commit hook to ensure code is formatted before committing
+
+# Run cargo fmt check
+if ! cargo fmt --all -- --check > /dev/null 2>&1; then
+    echo "❌ Code formatting check failed!"
+    echo ""
+    echo "Running cargo fmt to fix formatting..."
+    cargo fmt --all
+
+    echo ""
+    echo "✅ Code has been formatted."
+    echo "   Please review the changes and commit again."
+    echo ""
+    echo "   Run: git diff"
+    echo "   Then: git add . && git commit"
+    exit 1
+fi
+
+echo "✅ Formatting check passed"
+exit 0

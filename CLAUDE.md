@@ -42,7 +42,25 @@ cargo fmt
 
 # Run linter
 cargo clippy
+
+# Install git hooks (recommended for contributors)
+./scripts/install-hooks.sh
 ```
+
+## Git Hooks
+
+The project includes a pre-commit hook that automatically checks code formatting before each commit. To install:
+
+```bash
+./scripts/install-hooks.sh
+```
+
+The hook will:
+- Check if code is properly formatted with `cargo fmt`
+- Automatically run `cargo fmt` if formatting issues are found
+- Abort the commit and prompt you to review and re-commit the formatted code
+
+This ensures all commits pass CI formatting checks and maintains consistent code style.
 
 ## Architecture
 
