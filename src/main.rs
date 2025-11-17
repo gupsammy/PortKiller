@@ -929,9 +929,13 @@ fn query_docker_port_map() -> Result<HashMap<u16, DockerContainerInfo>> {
         .output();
     let out = match out {
         Ok(o) => o,
-        Err(_) => return Ok(map),
+        Err(err) => {
+            warn!("Docker command failed (docker not installed?): {}", err);
+            return Ok(map);
+        }
     };
     if !out.status.success() {
+        warn!("Docker ps command failed: {}", String::from_utf8_lossy(&out.stderr));
         return Ok(map);
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -946,17 +950,39 @@ fn query_docker_port_map() -> Result<HashMap<u16, DockerContainerInfo>> {
         // PORTS usually like: 0.0.0.0:5432->5432/tcp, :::5432->5432/tcp
         for seg in ports.split(',') {
             let seg = seg.trim();
-            if let Some((left, _right)) = seg.split_once("->")
-                && let Some((_, host)) = left.rsplit_once(':')
-                && let Ok(p) = host.parse::<u16>()
-            {
-                map.insert(
-                    p,
-                    DockerContainerInfo {
-                        name: name.clone(),
-                        id: id.clone(),
-                    },
-                );
+            if seg.is_empty() {
+                continue;
+            }
+
+            // Parse the port mapping format
+            if let Some((left, _right)) = seg.split_once("->") {
+                if let Some((_, host)) = left.rsplit_once(':') {
+                    // Check for port ranges (not yet supported)
+                    if host.contains('-') {
+                        warn!("Docker container '{}' exposes port range '{}' - port ranges not yet supported", name, host);
+                        continue;
+                    }
+
+                    // Try to parse single port
+                    match host.parse::<u16>() {
+                        Ok(p) => {
+                            map.insert(
+                                p,
+                                DockerContainerInfo {
+                                    name: name.clone(),
+                                    id: id.clone(),
+                                },
+                            );
+                        }
+                        Err(_) => {
+                            log::debug!("Failed to parse port '{}' from Docker mapping '{}' for container '{}'", host, seg, name);
+                        }
+                    }
+                } else {
+                    log::debug!("Failed to extract host port from Docker mapping '{}' for container '{}'", seg, name);
+                }
+            } else {
+                log::debug!("Failed to parse Docker port mapping '{}' for container '{}'", seg, name);
             }
         }
     }
