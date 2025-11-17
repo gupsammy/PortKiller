@@ -129,31 +129,31 @@ start_all() {
     # Start Node.js servers (if projects exist)
     if [ -d "$REPOS_DIR/ditherbaby" ]; then
         start_service 3000 "node" "Next.js (ditherbaby)" \
-            "cd $REPOS_DIR/ditherbaby && npm run dev"
+            "cd $REPOS_DIR/ditherbaby && npm run dev" || true
     fi
 
     if [ -d "$REPOS_DIR/image-editor" ]; then
         start_service 3001 "node" "React/Vite (image-editor)" \
-            "cd $REPOS_DIR/image-editor && npm run dev"
+            "cd $REPOS_DIR/image-editor && npm run dev" || true
     fi
 
     # Start Python HTTP servers
     start_service 5000 "python" "Python HTTP Server" \
-        "python3 -m http.server 5000"
+        "python3 -m http.server 5000" || true
 
     start_service 5173 "python" "Python HTTP Server (Vite port)" \
-        "python3 -m http.server 5173"
+        "python3 -m http.server 5173" || true
 
     start_service 8080 "python" "Python HTTP Server" \
-        "python3 -m http.server 8080"
+        "python3 -m http.server 8080" || true
 
     start_service 9000 "python" "Python HTTP Server" \
-        "python3 -m http.server 9000"
+        "python3 -m http.server 9000" || true
 
     # Start Vite server if bitbybitweb exists
     if [ -d "$REPOS_DIR/bitbybitweb" ]; then
         start_service 8000 "node" "Vite (bitbybitweb)" \
-            "cd $REPOS_DIR/bitbybitweb && npm run dev"
+            "cd $REPOS_DIR/bitbybitweb && npm run dev" || true
     fi
 
     # Start Redis
