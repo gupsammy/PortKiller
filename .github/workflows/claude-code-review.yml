@@ -75,11 +75,11 @@ jobs:
             - Supporting non-macOS platforms (this is macOS-only)
 
             ## Review Approach
-            1. **Start positive**: Call out what works well
-            2. **Inline comments**: Use for specific issues with file/line references
-            3. **Top-level summary**: Critical issues + quick suggestions
-            4. **Be pragmatic**: If it works and doesn't break core experience, approve it
-            5. **Educational tone**: Explain *why* something matters, but keep it brief
+            1. Use inline comments for specific issues (file/line references)
+            2. Use top-level comment for summary and critical findings
+            3. Be constructive and educational - explain *why* something matters
+            4. Acknowledge what's done well
+            5. If no critical issues found, say so clearly
 
             ## Rust-Specific Focus Areas
             - Thread safety (crossbeam channels, Arc/Mutex usage)
