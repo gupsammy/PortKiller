@@ -45,6 +45,11 @@ cleanup() {
         rm "$PIDS_FILE"
     fi
 
+    # Stop brew services (if running)
+    if command -v brew &> /dev/null; then
+        brew services stop redis > /dev/null 2>&1 || true
+    fi
+
     # Stop Docker containers
     docker ps -q --filter "name=macport-test-" | xargs -r docker stop > /dev/null 2>&1 || true
     docker ps -aq --filter "name=macport-test-" | xargs -r docker rm > /dev/null 2>&1 || true
@@ -184,22 +189,40 @@ start_all() {
         echo -e "${YELLOW}⚠️  $REPOS_DIR/bitbybitweb not found, skipping port 8000...${NC}"
     fi
 
-    # Start Redis
-    if command -v redis-server &> /dev/null; then
+    # Start Redis on 6379 via brew (to test brew-managed detection)
+    if command -v brew &> /dev/null && command -v redis-server &> /dev/null; then
         if ! check_port 6379; then
-            echo -e "${BLUE}Starting Redis on port 6379...${NC}"
-            redis-server --port 6379 --daemonize yes
-            sleep 0.5
+            echo -e "${BLUE}Starting Redis on port 6379 via brew services...${NC}"
+            brew services start redis > /dev/null 2>&1
+            sleep 1
             local redis_pid=$(pgrep -f "redis-server.*6379" | head -1)
             if [ -n "$redis_pid" ]; then
-                echo "$redis_pid:6379:redis:Redis Server" >> "$PIDS_FILE"
-                echo -e "${GREEN}✅ Redis running on port 6379 (PID: $redis_pid)${NC}"
+                echo "$redis_pid:6379:redis:Redis Server (brew-managed)" >> "$PIDS_FILE"
+                echo -e "${GREEN}✅ Redis running on port 6379 via brew (PID: $redis_pid)${NC}"
             fi
         else
-            echo -e "${YELLOW}⚠️  Port 6379 already in use, skipping Redis...${NC}"
+            echo -e "${YELLOW}⚠️  Port 6379 already in use, skipping brew Redis...${NC}"
         fi
     else
-        echo -e "${YELLOW}⚠️  redis-server not found, skipping...${NC}"
+        echo -e "${YELLOW}⚠️  brew or redis-server not found, skipping brew Redis...${NC}"
+    fi
+
+    # Start Redis on 6380 directly (to test direct process detection)
+    if command -v redis-server &> /dev/null; then
+        if ! check_port 6380; then
+            echo -e "${BLUE}Starting Redis on port 6380 directly (not via brew)...${NC}"
+            redis-server --port 6380 --daemonize yes
+            sleep 0.5
+            local redis_direct_pid=$(pgrep -f "redis-server.*6380" | head -1)
+            if [ -n "$redis_direct_pid" ]; then
+                echo "$redis_direct_pid:6380:redis:Redis Server (direct)" >> "$PIDS_FILE"
+                echo -e "${GREEN}✅ Redis running on port 6380 directly (PID: $redis_direct_pid)${NC}"
+            fi
+        else
+            echo -e "${YELLOW}⚠️  Port 6380 already in use, skipping direct Redis...${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  redis-server not found, skipping direct Redis...${NC}"
     fi
 
     # Start Docker containers
