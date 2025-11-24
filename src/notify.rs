@@ -4,7 +4,7 @@ use std::process::Command;
 use crate::model::{AppState, ProcessInfo};
 
 pub fn maybe_notify_changes(state: &AppState, prev: &[ProcessInfo]) {
-    if !state.config.notifications_enabled {
+    if !state.config.notifications.enabled {
         return;
     }
     let prev_ports: HashSet<u16> = prev.iter().map(|p| p.port).collect();

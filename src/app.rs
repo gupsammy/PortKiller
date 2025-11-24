@@ -12,7 +12,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::event::{Event, StartCause};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 
-use crate::config::{Config, get_config_path, load_or_create_config};
+use crate::config::{Config, get_config_path, load_or_create_config, save_config};
 use crate::integrations::brew::{query_brew_services_map, run_brew_stop};
 use crate::integrations::docker::{query_docker_port_map, run_docker_stop};
 use crate::model::*;
@@ -50,7 +50,7 @@ pub fn run() -> Result<()> {
     let _menu_thread = spawn_menu_listener(proxy.clone());
     let _worker = spawn_worker(worker_rx, proxy.clone());
 
-    let icon = create_icon(config.inactive_color).context("failed to create tray icon image")?;
+    let icon = create_icon(config.ui.inactive_color).context("failed to create tray icon image")?;
     let initial_menu = build_menu_with_context(&state).context("failed to build initial menu")?;
     let tray_icon = TrayIconBuilder::new()
         .with_icon(icon)
@@ -74,10 +74,18 @@ pub fn run() -> Result<()> {
             UserEvent::ProcessesUpdated(processes) => {
                 let prev = std::mem::take(&mut state.processes);
                 state.processes = processes;
-                // Refresh docker port map when we have listeners
-                state.docker_port_map = query_docker_port_map().unwrap_or_default();
-                // Refresh brew services map when we have listeners
-                state.brew_services_map = query_brew_services_map().unwrap_or_default();
+                // Refresh docker port map when we have listeners (if enabled)
+                if state.config.integrations.docker_enabled {
+                    state.docker_port_map = query_docker_port_map().unwrap_or_default();
+                } else {
+                    state.docker_port_map.clear();
+                }
+                // Refresh brew services map when we have listeners (if enabled)
+                if state.config.integrations.brew_enabled {
+                    state.brew_services_map = query_brew_services_map().unwrap_or_default();
+                } else {
+                    state.brew_services_map.clear();
+                }
                 // Derive project info in best-effort mode
                 refresh_projects_for(&mut state);
                 // Clean up stale cache entries for terminated processes
@@ -99,6 +107,64 @@ pub fn run() -> Result<()> {
                         "Opened config file: {}",
                         path_str
                     )));
+                    update_tray_display(&tray_icon, &state);
+                }
+                MenuAction::LaunchAtLogin => {
+                    use crate::launch::{
+                        disable_launch_at_login, enable_launch_at_login, is_launch_at_login_enabled,
+                    };
+
+                    // Toggle the current state
+                    let currently_enabled = state.config.system.launch_at_login;
+                    let result = if currently_enabled {
+                        disable_launch_at_login()
+                    } else {
+                        enable_launch_at_login()
+                    };
+
+                    match result {
+                        Ok(()) => {
+                            // Update config to match new state
+                            state.config.system.launch_at_login = !currently_enabled;
+                            if let Err(e) = save_config(&state.config) {
+                                state.last_feedback = Some(KillFeedback::error(format!(
+                                    "Failed to save config: {}",
+                                    e
+                                )));
+                            } else {
+                                state.last_feedback =
+                                    Some(KillFeedback::info(if !currently_enabled {
+                                        "Launch at login enabled".to_string()
+                                    } else {
+                                        "Launch at login disabled".to_string()
+                                    }));
+                            }
+                        }
+                        Err(e) => {
+                            // Check if it's the "requires approval" case
+                            let msg = e.to_string();
+                            if msg.contains("approve") || msg.contains("Login Items") {
+                                state.last_feedback = Some(KillFeedback::warning(
+                                    "Please approve in System Settings > Login Items".to_string(),
+                                ));
+                            } else {
+                                state.last_feedback = Some(KillFeedback::error(format!(
+                                    "Failed to toggle launch-at-login: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+
+                    // Verify actual system state and sync config
+                    if let Ok(actual_state) = is_launch_at_login_enabled() {
+                        if actual_state != state.config.system.launch_at_login {
+                            state.config.system.launch_at_login = actual_state;
+                            let _ = save_config(&state.config);
+                        }
+                    }
+
+                    sync_menu_with_context(&tray_icon, &state);
                     update_tray_display(&tray_icon, &state);
                 }
                 MenuAction::KillPid { pid, .. } => {
@@ -260,7 +326,7 @@ fn spawn_monitor_thread(
         let mut previous: Vec<ProcessInfo> = Vec::new();
         loop {
             let scan_start = std::time::Instant::now();
-            match scan_ports(&config.port_ranges) {
+            match scan_ports(&config.monitoring.port_ranges) {
                 Ok(mut processes) => {
                     let scan_duration = scan_start.elapsed();
                     processes.sort();
@@ -479,9 +545,9 @@ fn sync_menu_with_context(tray_icon: &TrayIcon, state: &AppState) {
 
 fn update_tray_display(tray_icon: &TrayIcon, state: &AppState) {
     let color = if state.processes.is_empty() {
-        state.config.inactive_color
+        state.config.ui.inactive_color
     } else {
-        state.config.active_color
+        state.config.ui.active_color
     };
 
     if let Ok(icon) = create_icon(color) {

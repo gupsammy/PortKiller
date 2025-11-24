@@ -40,12 +40,29 @@ User config stored at `~/.macport.json` (auto-created on first run):
 
 ```json
 {
-  "port_ranges": [[3000, 3010], [5432, 5432], ...],
-  "inactive_color": [255, 255, 255],    // Menu bar icon when idle
-  "active_color": [255, 69, 58],        // Icon when ports active
-  "notifications_enabled": true
+  "monitoring": {
+    "poll_interval_secs": 2,
+    "port_ranges": [[3000, 3010], [5432, 5432], ...],
+    "show_project_names": true
+  },
+  "integrations": {
+    "brew_enabled": true,
+    "docker_enabled": true
+  },
+  "ui": {
+    "inactive_color": [255, 255, 255],
+    "active_color": [255, 69, 58]
+  },
+  "notifications": {
+    "enabled": true
+  },
+  "system": {
+    "launch_at_login": false
+  }
 }
 ```
+
+**Legacy config format** (flat structure) is automatically migrated to new format on first run.
 
 Edit via menu: **Edit Configuration** opens in default text editor.
 

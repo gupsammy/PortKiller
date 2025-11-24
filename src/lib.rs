@@ -2,6 +2,7 @@ pub mod app;
 pub use app::run;
 
 pub mod config;
+pub mod launch;
 pub mod model;
 pub mod process {
     pub mod kill;

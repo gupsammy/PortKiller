@@ -27,6 +27,7 @@ pub enum MenuAction {
     BrewStop { service: String },
     BrewStopAll,
     EditConfig,
+    LaunchAtLogin,
     Quit,
 }
 
