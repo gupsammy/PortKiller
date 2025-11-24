@@ -40,10 +40,25 @@ User config stored at `~/.macport.json` (auto-created on first run):
 
 ```json
 {
-  "port_ranges": [[3000, 3010], [5432, 5432], ...],
-  "inactive_color": [255, 255, 255],    // Menu bar icon when idle
-  "active_color": [255, 69, 58],        // Icon when ports active
-  "notifications_enabled": true
+  "monitoring": {
+    "poll_interval_secs": 2,
+    "port_ranges": [[3000, 3010], [5432, 5432], ...],
+    "show_project_names": true
+  },
+  "integrations": {
+    "brew_enabled": true,
+    "docker_enabled": true
+  },
+  "ui": {
+    "inactive_color": [255, 255, 255],
+    "active_color": [255, 69, 58]
+  },
+  "notifications": {
+    "enabled": true
+  },
+  "system": {
+    "launch_at_login": false
+  }
 }
 ```
 
@@ -85,7 +100,7 @@ Four concurrent threads communicate via channels and event loop proxy:
 
 **app.rs**: Event loop orchestration, thread management, state coordination
 **config.rs**: Load/save user preferences, default port ranges
-**model.rs**: `AppState` (processes, Docker/Brew mappings, project cache, snooze state)
+**model.rs**: `AppState` (processes, Docker/Brew mappings, project cache)
 **process/ports.rs**: Parse `lsof` output, map ports to PIDs
 **process/kill.rs**: Graceful shutdown (SIGTERM → 2s → SIGKILL → 1s)
 **ui/menu.rs**: Dynamic menu with process/Docker/Brew items
@@ -98,7 +113,6 @@ Four concurrent threads communicate via channels and event loop proxy:
 - **Kill all**: Terminate all monitored processes
 - **Stop [docker container]**: `docker stop <container>`
 - **Stop [brew service]**: `brew services stop <service>`
-- **Snooze 30m**: Pause monitoring temporarily
 - **Edit Configuration**: Open `~/.macport.json`
 - **Quit**: Exit app
 

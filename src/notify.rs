@@ -1,16 +1,10 @@
 use std::collections::HashSet;
 use std::process::Command;
-use std::time::Instant;
 
 use crate::model::{AppState, ProcessInfo};
 
 pub fn maybe_notify_changes(state: &AppState, prev: &[ProcessInfo]) {
-    if !state.config.notifications_enabled {
-        return;
-    }
-    if let Some(until) = state.snooze_until
-        && Instant::now() < until
-    {
+    if !state.config.notifications.enabled {
         return;
     }
     let prev_ports: HashSet<u16> = prev.iter().map(|p| p.port).collect();

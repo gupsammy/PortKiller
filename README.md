@@ -86,21 +86,37 @@ To edit the configuration:
 Example configuration:
 ```json
 {
-  "port_ranges": [
-    [3000, 3010],
-    [5432, 5432],
-    [8080, 8090]
-  ],
-  "inactive_color": [255, 255, 255],
-  "active_color": [255, 69, 58]
+  "monitoring": {
+    "poll_interval_secs": 2,
+    "port_ranges": [
+      [3000, 3010],
+      [5432, 5432],
+      [8080, 8090]
+    ],
+    "show_project_names": true
+  },
+  "integrations": {
+    "brew_enabled": true,
+    "docker_enabled": true
+  },
+  "ui": {
+    "inactive_color": [255, 255, 255],
+    "active_color": [255, 69, 58]
+  },
+  "notifications": {
+    "enabled": true
+  },
+  "system": {
+    "launch_at_login": false
+  }
 }
 ```
 
 ### Color Customization
 
-The `inactive_color` and `active_color` fields accept RGB values (0-255 for each channel):
-- `inactive_color`: Icon color when no ports are active (default: white)
-- `active_color`: Icon color when ports are being monitored (default: red)
+The `ui.inactive_color` and `ui.active_color` fields accept RGB values (0-255 for each channel):
+- `ui.inactive_color`: Icon color when no ports are active (default: white)
+- `ui.active_color`: Icon color when ports are being monitored (default: red)
 
 Popular color options:
 - **Red**: `[255, 69, 58]` (default active)

@@ -7,85 +7,269 @@ use crate::model::{AppState, FeedbackSeverity, KillFeedback, ProcessInfo};
 
 const MAX_TOOLTIP_ENTRIES: usize = 5;
 const MENU_ID_KILL_ALL: &str = "kill_all";
+const MENU_ID_DOCKER_STOP_ALL: &str = "docker_stop_all";
+const MENU_ID_BREW_STOP_ALL: &str = "brew_stop_all";
 const MENU_ID_QUIT: &str = "quit";
 const MENU_ID_EDIT_CONFIG: &str = "edit_config";
+const MENU_ID_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const MENU_ID_PROCESS_PREFIX: &str = "process_";
 const MENU_ID_DOCKER_STOP_PREFIX: &str = "docker_stop_";
 const MENU_ID_BREW_STOP_PREFIX: &str = "brew_stop_";
 const MENU_ID_EMPTY: &str = "empty";
-const MENU_ID_SNOOZE_30M: &str = "snooze_30m";
+
+/// Maps common container names to friendly display names
+fn friendly_container_name(raw_name: &str) -> String {
+    // Strip common prefixes
+    let name = raw_name
+        .trim_start_matches("macport-")
+        .trim_start_matches("test-")
+        .trim_start_matches("dev-");
+
+    // Map to friendly names
+    match name {
+        "postgres" | "postgresql" => "PostgreSQL".to_string(),
+        "mongo" | "mongodb" => "MongoDB".to_string(),
+        "redis" => "Redis".to_string(),
+        "mysql" => "MySQL".to_string(),
+        "nginx" => "Nginx".to_string(),
+        "rabbitmq" => "RabbitMQ".to_string(),
+        "elasticsearch" => "Elasticsearch".to_string(),
+        "memcached" => "Memcached".to_string(),
+        _ => {
+            // Capitalize first letter of unknown containers
+            let mut chars = name.chars();
+            match chars.next() {
+                None => name.to_string(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        }
+    }
+}
 
 pub fn build_menu_with_context(state: &AppState) -> Result<Menu> {
     let menu = Menu::new();
     let processes = &state.processes;
+
     if processes.is_empty() {
         let item = MenuItem::with_id(MENU_ID_EMPTY, "No dev ports listening", false, None);
         menu.append(&item)?;
     } else {
-        let mut by_project: BTreeMap<String, Vec<&ProcessInfo>> = BTreeMap::new();
-        for p in processes {
-            let key = state
-                .project_cache
-                .get(&p.pid)
-                .map(|pi| pi.name.clone())
-                .unwrap_or_else(|| "(unknown project)".to_string());
-            by_project.entry(key).or_default().push(p);
+        // Separate processes into Docker, Brew, and regular processes
+        let mut docker_items: Vec<(&ProcessInfo, &crate::model::DockerContainerInfo)> = Vec::new();
+        let mut brew_items: Vec<(&ProcessInfo, String)> = Vec::new();
+        let mut regular_processes: Vec<&ProcessInfo> = Vec::new();
+
+        for process in processes {
+            if let Some(dc) = state.docker_port_map.get(&process.port) {
+                docker_items.push((process, dc));
+            } else if let Some(service) = crate::integrations::brew::get_brew_managed_service(
+                &process.command,
+                process.port,
+                &state.brew_services_map,
+            ) {
+                brew_items.push((process, service));
+            } else {
+                regular_processes.push(process);
+            }
         }
 
-        let mut total = 0usize;
-        for (project, items) in by_project {
+        let mut has_any_section = false;
+
+        // === PROCESSES SECTION ===
+        if !regular_processes.is_empty() {
+            has_any_section = true;
+
+            // Group by PID to count unique processes
+            let mut by_pid: BTreeMap<i32, (String, Vec<u16>)> = BTreeMap::new();
+            for p in &regular_processes {
+                let entry = by_pid
+                    .entry(p.pid)
+                    .or_insert_with(|| (p.command.clone(), Vec::new()));
+                if !entry.1.contains(&p.port) {
+                    entry.1.push(p.port);
+                }
+            }
+
             let header = MenuItem::with_id(
-                format!("header_{}", project),
-                format!("— {} —", project),
+                "header_processes",
+                format!("Processes · {}", by_pid.len()),
                 false,
                 None,
             );
             menu.append(&header)?;
-            for process in items {
-                total += 1;
 
-                if let Some(dc) = state.docker_port_map.get(&process.port) {
-                    let dlabel = format!("Stop container {} (port {})", dc.name, process.port);
-                    let did = format!("{}{}", MENU_ID_DOCKER_STOP_PREFIX, dc.name);
-                    let ditem = MenuItem::with_id(&did, &dlabel, true, None);
-                    menu.append(&ditem)?;
-                } else if let Some(service) = crate::integrations::brew::get_brew_managed_service(
-                    &process.command,
-                    process.port,
-                    &state.brew_services_map,
-                ) {
-                    let blabel = format!("Stop via brew {}", service);
-                    let bid = format!("{}{}", MENU_ID_BREW_STOP_PREFIX, service);
-                    let bitem = MenuItem::with_id(&bid, &blabel, true, None);
-                    menu.append(&bitem)?;
+            // Create clickable menu item for each process (grouped by PID)
+            for (pid, (command, ports)) in &mut by_pid {
+                ports.sort();
+
+                // Get project name for this PID
+                let project_name = state.project_cache.get(pid).map(|pi| pi.name.clone());
+
+                // Build main menu label: "ports · command · project"
+                let ports_str = ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let main_label = if let Some(ref project) = project_name {
+                    format!("{} · {} · {}", ports_str, command, project)
                 } else {
-                    let label = format!(
-                        "Kill {} (PID {}, port {})",
-                        process.command, process.pid, process.port
-                    );
-                    let item = MenuItem::with_id(
-                        MenuId::new(process_menu_id(process.pid, process.port)),
-                        label,
-                        true,
-                        None,
-                    );
-                    menu.append(&item)?;
-                }
+                    format!("{} · {}", ports_str, command)
+                };
+
+                // Create clickable menu item that kills the process when clicked
+                let process_item = MenuItem::with_id(
+                    MenuId::new(process_menu_id(*pid, ports[0])),
+                    main_label,
+                    true,
+                    None,
+                );
+                menu.append(&process_item)?;
             }
-            menu.append(&PredefinedMenuItem::separator())?;
+
+            // Kill All only if multiple processes
+            if by_pid.len() > 1 {
+                let kill_all =
+                    MenuItem::with_id(MENU_ID_KILL_ALL, "Kill All Processes", true, None);
+                menu.append(&kill_all)?;
+            }
         }
 
-        let kill_all_label = format!("Kill all ({})", total);
-        let kill_all_item = MenuItem::with_id(MENU_ID_KILL_ALL, kill_all_label, true, None);
-        menu.append(&kill_all_item)?;
+        // === DOCKER SECTION ===
+        if !docker_items.is_empty() {
+            if has_any_section {
+                menu.append(&PredefinedMenuItem::separator())?;
+            }
+            has_any_section = true;
+
+            // Group by container name
+            let mut by_container: BTreeMap<String, Vec<u16>> = BTreeMap::new();
+            for (process, dc) in &docker_items {
+                by_container
+                    .entry(dc.name.clone())
+                    .or_default()
+                    .push(process.port);
+            }
+
+            let header = MenuItem::with_id(
+                "header_docker",
+                format!("Docker Containers · {}", by_container.len()),
+                false,
+                None,
+            );
+            menu.append(&header)?;
+
+            // Check if we need Stop All before consuming the map
+            let needs_stop_all = by_container.len() > 1;
+
+            // Create clickable menu item for each container
+            for (container_name, mut ports) in by_container {
+                ports.sort();
+                let friendly = friendly_container_name(&container_name);
+
+                // Build label: "ports · container_name"
+                let ports_str = ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let main_label = format!("{} · {}", ports_str, friendly);
+
+                // Create clickable menu item that stops the container when clicked
+                let container_item = MenuItem::with_id(
+                    format!("{}{}", MENU_ID_DOCKER_STOP_PREFIX, container_name),
+                    main_label,
+                    true,
+                    None,
+                );
+                menu.append(&container_item)?;
+            }
+
+            // Stop All only if multiple containers
+            if needs_stop_all {
+                let stop_all =
+                    MenuItem::with_id(MENU_ID_DOCKER_STOP_ALL, "Stop All Containers", true, None);
+                menu.append(&stop_all)?;
+            }
+        }
+
+        // === BREW SECTION ===
+        if !brew_items.is_empty() {
+            if has_any_section {
+                menu.append(&PredefinedMenuItem::separator())?;
+            }
+
+            // Group by service name
+            let mut by_service: BTreeMap<String, Vec<u16>> = BTreeMap::new();
+            for (process, service) in &brew_items {
+                by_service
+                    .entry(service.clone())
+                    .or_default()
+                    .push(process.port);
+            }
+
+            let header = MenuItem::with_id(
+                "header_brew",
+                format!("Brew Services · {}", by_service.len()),
+                false,
+                None,
+            );
+            menu.append(&header)?;
+
+            // Check if we need Stop All before consuming the map
+            let needs_stop_all = by_service.len() > 1;
+
+            // Create clickable menu item for each service
+            for (service_name, mut ports) in by_service {
+                ports.sort();
+
+                // Build label: "ports · service_name"
+                let ports_str = ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let main_label = format!("{} · {}", ports_str, service_name);
+
+                // Create clickable menu item that stops the service when clicked
+                let service_item = MenuItem::with_id(
+                    format!("{}{}", MENU_ID_BREW_STOP_PREFIX, service_name),
+                    main_label,
+                    true,
+                    None,
+                );
+                menu.append(&service_item)?;
+            }
+
+            // Stop All only if multiple services
+            if needs_stop_all {
+                let stop_all =
+                    MenuItem::with_id(MENU_ID_BREW_STOP_ALL, "Stop All Services", true, None);
+                menu.append(&stop_all)?;
+            }
+        }
     }
 
     menu.append(&PredefinedMenuItem::separator())?;
-    let snooze_item = MenuItem::with_id(MENU_ID_SNOOZE_30M, "Snooze notifications 30m", true, None);
-    menu.append(&snooze_item)?;
     let edit_config_item =
         MenuItem::with_id(MENU_ID_EDIT_CONFIG, "Edit Configuration...", true, None);
     menu.append(&edit_config_item)?;
+
+    // Add checkable Launch at Login item
+    let launch_enabled = state.config.system.launch_at_login;
+    let launch_item = MenuItem::with_id(
+        MENU_ID_LAUNCH_AT_LOGIN,
+        if launch_enabled {
+            "✓ Launch at Login"
+        } else {
+            "Launch at Login"
+        },
+        true,
+        None,
+    );
+    menu.append(&launch_item)?;
+
     let quit_item = MenuItem::with_id(MENU_ID_QUIT, "Quit", true, None);
     menu.append(&quit_item)?;
     Ok(menu)
@@ -99,12 +283,16 @@ pub fn parse_menu_action(id: &MenuId) -> Option<crate::model::MenuAction> {
     let raw = id.as_ref();
     if raw == MENU_ID_KILL_ALL {
         Some(crate::model::MenuAction::KillAll)
+    } else if raw == MENU_ID_DOCKER_STOP_ALL {
+        Some(crate::model::MenuAction::DockerStopAll)
+    } else if raw == MENU_ID_BREW_STOP_ALL {
+        Some(crate::model::MenuAction::BrewStopAll)
     } else if raw == MENU_ID_QUIT {
         Some(crate::model::MenuAction::Quit)
     } else if raw == MENU_ID_EDIT_CONFIG {
         Some(crate::model::MenuAction::EditConfig)
-    } else if raw == MENU_ID_SNOOZE_30M {
-        Some(crate::model::MenuAction::Snooze30m)
+    } else if raw == MENU_ID_LAUNCH_AT_LOGIN {
+        Some(crate::model::MenuAction::LaunchAtLogin)
     } else if let Some(rest) = raw.strip_prefix(MENU_ID_DOCKER_STOP_PREFIX) {
         Some(crate::model::MenuAction::DockerStop {
             container: sanitize_identifier(rest),
@@ -230,10 +418,6 @@ mod tests {
             parse_menu_action(&MenuId::new("edit_config")),
             Some(MenuAction::EditConfig)
         ));
-        assert!(matches!(
-            parse_menu_action(&MenuId::new("snooze_30m")),
-            Some(MenuAction::Snooze30m)
-        ));
     }
 
     #[test]
@@ -249,6 +433,14 @@ mod tests {
         assert!(matches!(
             parse_menu_action(&MenuId::new("process_1234_3000")),
             Some(MenuAction::KillPid { pid }) if pid == 1234
+        ));
+        assert!(matches!(
+            parse_menu_action(&MenuId::new("docker_stop_all")),
+            Some(MenuAction::DockerStopAll)
+        ));
+        assert!(matches!(
+            parse_menu_action(&MenuId::new("brew_stop_all")),
+            Some(MenuAction::BrewStopAll)
         ));
     }
 
