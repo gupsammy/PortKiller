@@ -651,10 +651,10 @@ fn is_safe_path(path: &std::path::Path) -> bool {
         Err(_) => return false,
     };
     // Allow paths under home directory
-    if let Ok(home) = std::env::var("HOME") {
-        if canonical.starts_with(&home) {
-            return true;
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && canonical.starts_with(&home)
+    {
+        return true;
     }
     // Allow /tmp and /var/folders (macOS temp)
     if canonical.starts_with("/tmp") || canonical.starts_with("/var/folders") {

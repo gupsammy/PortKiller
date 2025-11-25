@@ -38,7 +38,7 @@ pub struct NotificationsConfig {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct SystemConfig {
     pub launch_at_login: bool,
@@ -78,14 +78,6 @@ impl Default for IntegrationsConfig {
 impl Default for NotificationsConfig {
     fn default() -> Self {
         Self { enabled: true }
-    }
-}
-
-impl Default for SystemConfig {
-    fn default() -> Self {
-        Self {
-            launch_at_login: false,
-        }
     }
 }
 
