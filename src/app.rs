@@ -27,6 +27,7 @@ use crate::ui::menu::{
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const INTEGRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // menu constants moved under ui::menu
 
 pub fn run() -> Result<()> {
@@ -48,8 +49,8 @@ pub fn run() -> Result<()> {
     let (worker_tx, worker_rx) = crossbeam_channel::unbounded();
 
     let _monitor_thread = spawn_monitor_thread(proxy.clone(), config.clone());
-    let _menu_thread = spawn_menu_listener(proxy.clone());
     let _worker = spawn_worker(worker_rx, proxy.clone());
+    let menu_receiver = MenuEvent::receiver().clone();
 
     let icon =
         create_template_icon(IconVariant::Inactive).context("failed to create tray icon image")?;
@@ -72,7 +73,19 @@ pub fn run() -> Result<()> {
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
         Event::NewEvents(StartCause::Init) => {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // Use WaitUntil to periodically check for menu events
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + MENU_POLL_INTERVAL));
+        }
+        Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+            // Poll for menu events (replaces dedicated menu listener thread)
+            while let Ok(event) = menu_receiver.try_recv() {
+                if let Some(action) = parse_menu_action(event.id()) {
+                    let _ = proxy.send_event(UserEvent::MenuAction(action));
+                }
+            }
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + MENU_POLL_INTERVAL));
         }
         Event::UserEvent(user_event) => match user_event {
             UserEvent::ProcessesUpdated(processes) => {
@@ -386,20 +399,6 @@ fn spawn_monitor_thread(
                     }
                     thread::sleep(POLL_INTERVAL);
                 }
-            }
-        }
-    })
-}
-
-fn spawn_menu_listener(proxy: EventLoopProxy<UserEvent>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let receiver = MenuEvent::receiver().clone();
-        for event in receiver.iter() {
-            let Some(action) = parse_menu_action(event.id()) else {
-                continue;
-            };
-            if proxy.send_event(UserEvent::MenuAction(action)).is_err() {
-                break;
             }
         }
     })
