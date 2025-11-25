@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -93,4 +93,5 @@ jobs:
             **If everything looks good and works, say so clearly and approve!**
 
           # Tools for comprehensive review with inline comments and gh CLI
-          claude_args: '--allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh:*), Bash(cargo:*)"'
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh:*), Bash(cargo:*)"
