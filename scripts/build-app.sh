@@ -28,10 +28,15 @@ mkdir -p "${APP_DIR}/Contents/Resources"
 echo "📋 Copying binary..."
 cp "${BUILD_DIR}/${BINARY_NAME}" "${APP_DIR}/Contents/MacOS/"
 
-# Step 3.5: Copy icon if available
+# Step 3.5: Copy icons if available
 if [ -f "assets/AppIcon.icns" ]; then
     echo "🎨 Copying app icon..."
     cp "assets/AppIcon.icns" "${APP_DIR}/Contents/Resources/"
+fi
+# Also copy PNG version for notifications (terminal-notifier needs PNG)
+if [ -f "assets/app-logo-color.png" ]; then
+    echo "🎨 Copying notification icon (PNG)..."
+    cp "assets/app-logo-color.png" "${APP_DIR}/Contents/Resources/AppIcon.png"
 fi
 
 # Step 4: Create Info.plist

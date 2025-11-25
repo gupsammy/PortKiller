@@ -64,7 +64,7 @@ fn truncate_command(command: &str, max_len: usize) -> String {
 }
 
 fn notify(title: &str, body: &str) {
-    // Try terminal-notifier first (supports custom icons)
+    // Try terminal-notifier first (better sound and icon support)
     if notify_with_terminal_notifier(title, body) {
         return;
     }
@@ -73,19 +73,44 @@ fn notify(title: &str, body: &str) {
 }
 
 fn notify_with_terminal_notifier(title: &str, body: &str) -> bool {
-    Command::new("terminal-notifier")
-        .args([
-            "-title", title, "-message", body, "-sender", BUNDLE_ID, "-sound", "default",
-        ])
-        .spawn()
-        .is_ok()
+    // Check if running from .app bundle and get icon path
+    let current_exe = std::env::current_exe().ok();
+    let app_icon_url = current_exe.as_ref().and_then(|exe| {
+        let exe_str = exe.to_str()?;
+        if exe_str.contains(".app/Contents/MacOS") {
+            // Use PNG icon in Resources for terminal-notifier
+            let app_path = exe_str.split(".app/").next()?;
+            let png_path = format!("{}.app/Contents/Resources/AppIcon.png", app_path);
+            // Verify the file exists
+            if std::path::Path::new(&png_path).exists() {
+                Some(format!("file://{}", png_path))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    let mut cmd = Command::new("terminal-notifier");
+    cmd.args(["-title", title, "-message", body, "-sound", "Glass"]);
+
+    // Add explicit icon URL when running from .app bundle
+    if let Some(icon_url) = &app_icon_url {
+        cmd.args(["-appIcon", icon_url]);
+    } else {
+        // Fallback to sender bundle ID for standalone binary
+        cmd.args(["-sender", BUNDLE_ID]);
+    }
+
+    cmd.spawn().is_ok()
 }
 
 fn notify_with_osascript(title: &str, body: &str) {
     let title_escaped = title.replace('"', "'");
     let body_escaped = body.replace('"', "'");
     let script = format!(
-        "display notification \"{}\" with title \"{}\" sound name \"default\"",
+        "display notification \"{}\" with title \"{}\" sound name \"Glass\"",
         body_escaped, title_escaped
     );
     let _ = Command::new("osascript").args(["-e", &script]).spawn();
