@@ -64,15 +64,12 @@ fn truncate_command(command: &str, max_len: usize) -> String {
 }
 
 fn notify(title: &str, body: &str) {
-    // Try terminal-notifier first (better sound and icon support)
-    if notify_with_terminal_notifier(title, body) {
-        return;
-    }
-    // Fallback to osascript
-    notify_with_osascript(title, body);
+    // Use terminal-notifier only - osascript fallback removed due to command injection risk
+    // (malicious process names could contain AppleScript syntax)
+    notify_with_terminal_notifier(title, body);
 }
 
-fn notify_with_terminal_notifier(title: &str, body: &str) -> bool {
+fn notify_with_terminal_notifier(title: &str, body: &str) {
     // Find terminal-notifier - check common homebrew paths first (needed for .app bundles
     // where PATH doesn't include homebrew), then fall back to PATH lookup
     let terminal_notifier = [
@@ -91,23 +88,12 @@ fn notify_with_terminal_notifier(title: &str, body: &str) -> bool {
     });
 
     let Some(cmd_path) = terminal_notifier else {
-        return false;
+        return;
     };
 
-    Command::new(cmd_path)
+    let _ = Command::new(cmd_path)
         .args([
             "-title", title, "-message", body, "-sender", BUNDLE_ID, "-sound", "Glass",
         ])
-        .spawn()
-        .is_ok()
-}
-
-fn notify_with_osascript(title: &str, body: &str) {
-    let title_escaped = title.replace('"', "'");
-    let body_escaped = body.replace('"', "'");
-    let script = format!(
-        "display notification \"{}\" with title \"{}\" sound name \"Glass\"",
-        body_escaped, title_escaped
-    );
-    let _ = Command::new("osascript").args(["-e", &script]).spawn();
+        .spawn();
 }
