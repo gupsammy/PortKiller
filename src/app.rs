@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
@@ -26,6 +26,7 @@ use crate::ui::menu::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const INTEGRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 // menu constants moved under ui::menu
 
 pub fn run() -> Result<()> {
@@ -66,6 +67,7 @@ pub fn run() -> Result<()> {
 
     update_tray_display(&tray_icon, &state);
     let mut worker_sender: Option<Sender<WorkerCommand>> = Some(worker_tx);
+    let mut last_integration_refresh = Instant::now();
 
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
@@ -76,16 +78,23 @@ pub fn run() -> Result<()> {
             UserEvent::ProcessesUpdated(processes) => {
                 let prev = std::mem::take(&mut state.processes);
                 state.processes = processes;
-                // Refresh docker port map when we have listeners (if enabled)
-                if state.config.integrations.docker_enabled {
-                    state.docker_port_map = query_docker_port_map().unwrap_or_default();
-                } else {
+                // Refresh integrations less frequently (every 5s) to reduce overhead
+                let integration_refresh_needed =
+                    last_integration_refresh.elapsed() >= INTEGRATION_REFRESH_INTERVAL;
+                if integration_refresh_needed {
+                    last_integration_refresh = Instant::now();
+                    if state.config.integrations.docker_enabled {
+                        state.docker_port_map = query_docker_port_map().unwrap_or_default();
+                    }
+                    if state.config.integrations.brew_enabled {
+                        state.brew_services_map = query_brew_services_map().unwrap_or_default();
+                    }
+                }
+                // Clear maps if integrations disabled (check every time)
+                if !state.config.integrations.docker_enabled {
                     state.docker_port_map.clear();
                 }
-                // Refresh brew services map when we have listeners (if enabled)
-                if state.config.integrations.brew_enabled {
-                    state.brew_services_map = query_brew_services_map().unwrap_or_default();
-                } else {
+                if !state.config.integrations.brew_enabled {
                     state.brew_services_map.clear();
                 }
                 // Derive project info in best-effort mode
