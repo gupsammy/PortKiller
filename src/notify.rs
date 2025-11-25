@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::process::Command;
 
 use crate::model::{AppState, ProcessInfo};
+use crate::utils::find_command;
 
 const BUNDLE_ID: &str = "com.samarthgupta.portkiller";
 
@@ -70,28 +71,13 @@ fn notify(title: &str, body: &str) {
 }
 
 fn notify_with_terminal_notifier(title: &str, body: &str) {
-    // Find terminal-notifier - check common homebrew paths first (needed for .app bundles
-    // where PATH doesn't include homebrew), then fall back to PATH lookup
-    let terminal_notifier = [
-        "/opt/homebrew/bin/terminal-notifier", // Apple Silicon
-        "/usr/local/bin/terminal-notifier",    // Intel Mac
-        "terminal-notifier",                   // PATH lookup (works for standalone binary)
-    ]
-    .iter()
-    .find(|path| {
-        if path.starts_with('/') {
-            std::path::Path::new(path).exists()
-        } else {
-            // For PATH lookup, try spawning with --help to check if it exists
-            Command::new(path).arg("-help").output().is_ok()
-        }
-    });
-
-    let Some(cmd_path) = terminal_notifier else {
+    let cmd = find_command("terminal-notifier");
+    // Check if terminal-notifier exists (find_command falls back to name if not found)
+    if !std::path::Path::new(cmd).exists() && Command::new(cmd).arg("-help").output().is_err() {
         return;
-    };
+    }
 
-    let _ = Command::new(cmd_path)
+    let _ = Command::new(cmd)
         .args([
             "-title", title, "-message", body, "-sender", BUNDLE_ID, "-sound", "Glass",
         ])

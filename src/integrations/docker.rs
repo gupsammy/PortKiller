@@ -5,26 +5,11 @@ use anyhow::Result;
 use log::warn;
 
 use crate::model::{DockerContainerInfo, KillFeedback};
-
-/// Find docker executable in common locations
-fn find_docker_command() -> &'static str {
-    const DOCKER_PATHS: &[&str] = &[
-        "/opt/homebrew/bin/docker", // Apple Silicon
-        "/usr/local/bin/docker",    // Intel Mac
-        "docker",                   // Fallback to PATH
-    ];
-
-    for path in DOCKER_PATHS {
-        if std::path::Path::new(path).exists() {
-            return path;
-        }
-    }
-    "docker" // Fallback
-}
+use crate::utils::find_command;
 
 pub fn query_docker_port_map() -> Result<HashMap<u16, DockerContainerInfo>> {
     let mut map = HashMap::new();
-    let out = Command::new(find_docker_command())
+    let out = Command::new(find_command("docker"))
         .args(["ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Ports}}"])
         .output();
     let out = match out {
@@ -77,7 +62,7 @@ pub fn query_docker_port_map() -> Result<HashMap<u16, DockerContainerInfo>> {
 }
 
 pub fn run_docker_stop(container: &str) -> KillFeedback {
-    let res = Command::new(find_docker_command())
+    let res = Command::new(find_command("docker"))
         .args(["stop", container])
         .output();
     match res {

@@ -5,26 +5,11 @@ use anyhow::Result;
 use log::warn;
 
 use crate::model::KillFeedback;
-
-/// Find brew executable in common locations
-fn find_brew_command() -> &'static str {
-    const BREW_PATHS: &[&str] = &[
-        "/opt/homebrew/bin/brew", // Apple Silicon
-        "/usr/local/bin/brew",    // Intel Mac
-        "brew",                   // Fallback to PATH
-    ];
-
-    for path in BREW_PATHS {
-        if std::path::Path::new(path).exists() {
-            return path;
-        }
-    }
-    "brew" // Fallback
-}
+use crate::utils::find_command;
 
 pub fn query_brew_services_map() -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
-    let out = Command::new(find_brew_command())
+    let out = Command::new(find_command("brew"))
         .args(["services", "list"])
         .output();
     let out = match out {
@@ -76,7 +61,7 @@ pub fn get_brew_managed_service(
 }
 
 pub fn run_brew_stop(service: &str) -> KillFeedback {
-    let res = Command::new(find_brew_command())
+    let res = Command::new(find_command("brew"))
         .args(["services", "stop", service])
         .output();
     match res {
