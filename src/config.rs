@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -17,85 +18,50 @@ pub struct Config {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct MonitoringConfig {
-    #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    #[serde(default = "default_port_ranges")]
     pub port_ranges: Vec<(u16, u16)>,
-    #[serde(default = "default_show_project_names")]
     pub show_project_names: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct IntegrationsConfig {
-    #[serde(default = "default_brew_enabled")]
     pub brew_enabled: bool,
-    #[serde(default = "default_docker_enabled")]
     pub docker_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct NotificationsConfig {
-    #[serde(default = "default_notifications_enabled")]
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct SystemConfig {
-    #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
-}
-
-// Defaults for MonitoringConfig
-fn default_poll_interval_secs() -> u64 {
-    2
-}
-
-fn default_port_ranges() -> Vec<(u16, u16)> {
-    vec![
-        (3000, 3010),   // Node.js, React, Next.js, Vite
-        (3306, 3306),   // MySQL
-        (4000, 4010),   // Alternative Node servers
-        (5001, 5010),   // Flask, general dev servers (excluding 5000)
-        (5173, 5173),   // Vite default
-        (5432, 5432),   // PostgreSQL
-        (6379, 6380),   // Redis (6379 default, 6380 for testing)
-        (8000, 8100),   // Django, Python HTTP servers
-        (8080, 8090),   // Tomcat, alternative HTTP
-        (9000, 9010),   // Various dev tools
-        (27017, 27017), // MongoDB
-    ]
-}
-
-fn default_show_project_names() -> bool {
-    true
-}
-
-// Defaults for IntegrationsConfig
-fn default_brew_enabled() -> bool {
-    true
-}
-
-fn default_docker_enabled() -> bool {
-    true
-}
-
-// Defaults for NotificationsConfig
-fn default_notifications_enabled() -> bool {
-    true
-}
-
-// Defaults for SystemConfig
-fn default_launch_at_login() -> bool {
-    false
 }
 
 impl Default for MonitoringConfig {
     fn default() -> Self {
         Self {
-            poll_interval_secs: default_poll_interval_secs(),
-            port_ranges: default_port_ranges(),
-            show_project_names: default_show_project_names(),
+            poll_interval_secs: 2,
+            port_ranges: vec![
+                (3000, 3010),   // Node.js, React, Next.js, Vite
+                (3306, 3306),   // MySQL
+                (4000, 4010),   // Alternative Node servers
+                (5001, 5010),   // Flask, general dev servers (excluding 5000)
+                (5173, 5173),   // Vite default
+                (5432, 5432),   // PostgreSQL
+                (6379, 6380),   // Redis (6379 default, 6380 for testing)
+                (8000, 8100),   // Django, Python HTTP servers
+                (8080, 8090),   // Tomcat, alternative HTTP
+                (9000, 9010),   // Various dev tools
+                (27017, 27017), // MongoDB
+            ],
+            show_project_names: true,
         }
     }
 }
@@ -103,25 +69,15 @@ impl Default for MonitoringConfig {
 impl Default for IntegrationsConfig {
     fn default() -> Self {
         Self {
-            brew_enabled: default_brew_enabled(),
-            docker_enabled: default_docker_enabled(),
+            brew_enabled: true,
+            docker_enabled: true,
         }
     }
 }
 
 impl Default for NotificationsConfig {
     fn default() -> Self {
-        Self {
-            enabled: default_notifications_enabled(),
-        }
-    }
-}
-
-impl Default for SystemConfig {
-    fn default() -> Self {
-        Self {
-            launch_at_login: default_launch_at_login(),
-        }
+        Self { enabled: true }
     }
 }
 
@@ -134,8 +90,13 @@ pub fn load_or_create_config() -> Result<Config> {
     let path = get_config_path();
 
     if path.exists() {
+        // Validate file permissions (should be 0600 for security)
+        ensure_secure_permissions(&path)?;
         let content = fs::read_to_string(&path).context("failed to read config file")?;
-        serde_json::from_str::<Config>(&content).context("failed to parse config file")
+        let config: Config =
+            serde_json::from_str(&content).context("failed to parse config file")?;
+        validate_config(&config)?;
+        Ok(config)
     } else {
         let config = Config::default();
         save_config(&config)?;
@@ -146,6 +107,41 @@ pub fn load_or_create_config() -> Result<Config> {
 pub fn save_config(config: &Config) -> Result<()> {
     let path = get_config_path();
     let content = serde_json::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(&path, content).context("failed to write config file")?;
+    fs::write(&path, &content).context("failed to write config file")?;
+    // Set secure permissions (owner read/write only)
+    fs::set_permissions(&path, Permissions::from_mode(0o600))
+        .context("failed to set config file permissions")?;
+    Ok(())
+}
+
+fn ensure_secure_permissions(path: &PathBuf) -> Result<()> {
+    let metadata = fs::metadata(path).context("failed to read config file metadata")?;
+    let mode = metadata.permissions().mode();
+    // Check if group or others have any permissions (should be 0600)
+    if mode & 0o077 != 0 {
+        log::warn!(
+            "Config file has insecure permissions ({:o}), fixing to 0600",
+            mode & 0o777
+        );
+        fs::set_permissions(path, Permissions::from_mode(0o600))
+            .context("failed to fix config file permissions")?;
+    }
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    // Validate poll interval (1-300 seconds)
+    if config.monitoring.poll_interval_secs == 0 || config.monitoring.poll_interval_secs > 300 {
+        anyhow::bail!(
+            "poll_interval_secs must be between 1 and 300, got {}",
+            config.monitoring.poll_interval_secs
+        );
+    }
+    // Validate port ranges (u16 already enforces 0-65535)
+    for (start, end) in &config.monitoring.port_ranges {
+        if start > end {
+            anyhow::bail!("invalid port range: start ({}) > end ({})", start, end);
+        }
+    }
     Ok(())
 }

@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use anyhow::{Result, anyhow};
 use png::Decoder;
 use tray_icon::Icon;
@@ -6,6 +8,16 @@ use tray_icon::Icon;
 // Filled = active (ports listening), Outline = inactive (no ports)
 static ICON_FILLED: &[u8] = include_bytes!("../../assets/menubar-icon-filled@2x.png");
 static ICON_OUTLINE: &[u8] = include_bytes!("../../assets/menubar-icon-outline@2x.png");
+
+// Cache decoded RGBA data to avoid repeated PNG decoding
+struct CachedIconData {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+static ICON_ACTIVE_CACHE: OnceLock<CachedIconData> = OnceLock::new();
+static ICON_INACTIVE_CACHE: OnceLock<CachedIconData> = OnceLock::new();
 
 /// Icon variant for different states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,17 +29,22 @@ pub enum IconVariant {
 }
 
 /// Create a template icon for the menu bar.
-/// Loads the appropriate icon variant from embedded PNG.
+/// Uses cached decoded RGBA data to avoid repeated PNG decoding.
 /// macOS automatically adapts the color based on menu bar appearance.
 pub fn create_template_icon(variant: IconVariant) -> Result<Icon> {
-    let png_data = match variant {
-        IconVariant::Inactive => ICON_OUTLINE,
-        IconVariant::Active => ICON_FILLED,
+    let cached = match variant {
+        IconVariant::Active => {
+            ICON_ACTIVE_CACHE.get_or_init(|| decode_png_to_rgba(ICON_FILLED).unwrap())
+        }
+        IconVariant::Inactive => {
+            ICON_INACTIVE_CACHE.get_or_init(|| decode_png_to_rgba(ICON_OUTLINE).unwrap())
+        }
     };
-    load_png_icon(png_data)
+    Icon::from_rgba(cached.rgba.clone(), cached.width, cached.height)
+        .map_err(|e| anyhow!("failed to create icon: {e}"))
 }
 
-fn load_png_icon(png_data: &[u8]) -> Result<Icon> {
+fn decode_png_to_rgba(png_data: &[u8]) -> Result<CachedIconData> {
     let decoder = Decoder::new(png_data);
     let mut reader = decoder
         .read_info()
@@ -73,5 +90,9 @@ fn load_png_icon(png_data: &[u8]) -> Result<Icon> {
         }
     };
 
-    Icon::from_rgba(rgba, width, height).map_err(|e| anyhow!("failed to create icon: {e}"))
+    Ok(CachedIconData {
+        rgba,
+        width,
+        height,
+    })
 }

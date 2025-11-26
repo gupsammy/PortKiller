@@ -6,6 +6,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use crate::model::KillOutcome;
+use crate::process::ports::verify_pid_is_listener;
 
 const SIGTERM_GRACE: Duration = Duration::from_secs(2);
 const SIGKILL_GRACE: Duration = Duration::from_secs(1);
@@ -19,6 +20,16 @@ pub fn terminate_pid(pid_raw: i32) -> KillOutcome {
         Err(Errno::ESRCH) => return KillOutcome::AlreadyExited,
         Err(err) => return KillOutcome::Failed(err),
         Ok(()) => {}
+    }
+
+    // TOCTOU mitigation: verify PID is still a TCP listener before killing
+    // This reduces (but doesn't eliminate) the risk of killing a reused PID
+    if !verify_pid_is_listener(pid_raw) {
+        log::warn!(
+            "PID {} is no longer a TCP listener, skipping kill to avoid TOCTOU race",
+            pid_raw
+        );
+        return KillOutcome::AlreadyExited;
     }
 
     let mut last_perm_denied = false;

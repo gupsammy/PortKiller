@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
@@ -25,7 +25,10 @@ use crate::ui::menu::{
     parse_menu_action,
 };
 
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const IDLE_THRESHOLD: Duration = Duration::from_secs(30);
+const IDLE_MULTIPLIER: u64 = 2; // Idle poll interval = base * IDLE_MULTIPLIER
+const INTEGRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // menu constants moved under ui::menu
 
 pub fn run() -> Result<()> {
@@ -47,8 +50,8 @@ pub fn run() -> Result<()> {
     let (worker_tx, worker_rx) = crossbeam_channel::unbounded();
 
     let _monitor_thread = spawn_monitor_thread(proxy.clone(), config.clone());
-    let _menu_thread = spawn_menu_listener(proxy.clone());
     let _worker = spawn_worker(worker_rx, proxy.clone());
+    let menu_receiver = MenuEvent::receiver().clone();
 
     let icon =
         create_template_icon(IconVariant::Inactive).context("failed to create tray icon image")?;
@@ -66,26 +69,51 @@ pub fn run() -> Result<()> {
 
     update_tray_display(&tray_icon, &state);
     let mut worker_sender: Option<Sender<WorkerCommand>> = Some(worker_tx);
+    // Initialize to past time to force first integration refresh
+    let mut last_integration_refresh = Instant::now() - INTEGRATION_REFRESH_INTERVAL;
 
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
         Event::NewEvents(StartCause::Init) => {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // Use WaitUntil to periodically check for menu events
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + MENU_POLL_INTERVAL));
+        }
+        Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+            // Poll for menu events (replaces dedicated menu listener thread)
+            while let Ok(event) = menu_receiver.try_recv() {
+                if let Some(action) = parse_menu_action(event.id()) {
+                    let _ = proxy.send_event(UserEvent::MenuAction(action));
+                }
+            }
+            event_loop
+                .set_control_flow(ControlFlow::WaitUntil(Instant::now() + MENU_POLL_INTERVAL));
         }
         Event::UserEvent(user_event) => match user_event {
             UserEvent::ProcessesUpdated(processes) => {
                 let prev = std::mem::take(&mut state.processes);
                 state.processes = processes;
-                // Refresh docker port map when we have listeners (if enabled)
-                if state.config.integrations.docker_enabled {
-                    state.docker_port_map = query_docker_port_map().unwrap_or_default();
-                } else {
+                // Detect if ports changed (not just process list) to trigger integration refresh
+                let prev_ports: HashSet<u16> = prev.iter().map(|p| p.port).collect();
+                let curr_ports: HashSet<u16> = state.processes.iter().map(|p| p.port).collect();
+                let ports_changed = prev_ports != curr_ports;
+                // Refresh integrations when ports change OR on timer (to catch external changes)
+                let timer_refresh =
+                    last_integration_refresh.elapsed() >= INTEGRATION_REFRESH_INTERVAL;
+                if ports_changed || timer_refresh {
+                    last_integration_refresh = Instant::now();
+                    if state.config.integrations.docker_enabled {
+                        state.docker_port_map = query_docker_port_map().unwrap_or_default();
+                    }
+                    if state.config.integrations.brew_enabled {
+                        state.brew_services_map = query_brew_services_map().unwrap_or_default();
+                    }
+                }
+                // Clear maps if integrations disabled (check every time)
+                if !state.config.integrations.docker_enabled {
                     state.docker_port_map.clear();
                 }
-                // Refresh brew services map when we have listeners (if enabled)
-                if state.config.integrations.brew_enabled {
-                    state.brew_services_map = query_brew_services_map().unwrap_or_default();
-                } else {
+                if !state.config.integrations.brew_enabled {
                     state.brew_services_map.clear();
                 }
                 // Derive project info in best-effort mode
@@ -340,10 +368,16 @@ fn spawn_monitor_thread(
     proxy: EventLoopProxy<UserEvent>,
     config: Config,
 ) -> thread::JoinHandle<()> {
+    // Use config's poll interval, with idle being a multiple of it
+    let poll_interval_active = Duration::from_secs(config.monitoring.poll_interval_secs);
+    let poll_interval_idle =
+        Duration::from_secs(config.monitoring.poll_interval_secs * IDLE_MULTIPLIER);
+
     thread::spawn(move || {
         let mut previous: Vec<ProcessInfo> = Vec::new();
+        let mut last_change = Instant::now();
         loop {
-            let scan_start = std::time::Instant::now();
+            let scan_start = Instant::now();
             match scan_ports(&config.monitoring.port_ranges) {
                 Ok(mut processes) => {
                     let scan_duration = scan_start.elapsed();
@@ -353,6 +387,7 @@ fn spawn_monitor_thread(
                             "Change detected (scan took {:?}). Polling immediately for rapid changes.",
                             scan_duration
                         );
+                        last_change = Instant::now();
                         previous = processes.clone();
                         if proxy
                             .send_event(UserEvent::ProcessesUpdated(processes))
@@ -362,12 +397,19 @@ fn spawn_monitor_thread(
                         }
                         continue;
                     } else {
+                        // Adaptive polling: use longer interval when idle
+                        let poll_interval = if last_change.elapsed() > IDLE_THRESHOLD {
+                            poll_interval_idle
+                        } else {
+                            poll_interval_active
+                        };
                         log::trace!(
-                            "No change (scan took {:?}). Sleeping {}s.",
+                            "No change (scan took {:?}). Sleeping {}s (idle: {}).",
                             scan_duration,
-                            POLL_INTERVAL.as_secs()
+                            poll_interval.as_secs(),
+                            last_change.elapsed() > IDLE_THRESHOLD
                         );
-                        thread::sleep(POLL_INTERVAL);
+                        thread::sleep(poll_interval);
                     }
                 }
                 Err(err) => {
@@ -375,22 +417,8 @@ fn spawn_monitor_thread(
                     if proxy.send_event(UserEvent::MonitorError(message)).is_err() {
                         break;
                     }
-                    thread::sleep(POLL_INTERVAL);
+                    thread::sleep(poll_interval_active);
                 }
-            }
-        }
-    })
-}
-
-fn spawn_menu_listener(proxy: EventLoopProxy<UserEvent>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let receiver = MenuEvent::receiver().clone();
-        for event in receiver.iter() {
-            let Some(action) = parse_menu_action(event.id()) else {
-                continue;
-            };
-            if proxy.send_event(UserEvent::MenuAction(action)).is_err() {
-                break;
             }
         }
     })
@@ -595,6 +623,19 @@ fn refresh_projects_for(state: &mut AppState) {
 }
 
 fn resolve_project_info(pid: i32) -> Option<ProjectInfo> {
+    let path = get_process_cwd(pid)?;
+    // Validate path is in safe location (home dir or /tmp)
+    if !is_safe_path(&path) {
+        log::debug!("Skipping project resolution for unsafe path: {:?}", path);
+        return None;
+    }
+    let name = get_git_repo_name(&path)
+        .or_else(|| dir_name(&path))
+        .unwrap_or_else(|| "(unknown)".to_string());
+    Some(ProjectInfo { name, path })
+}
+
+fn get_process_cwd(pid: i32) -> Option<std::path::PathBuf> {
     let out = Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
@@ -602,42 +643,57 @@ fn resolve_project_info(pid: i32) -> Option<ProjectInfo> {
     if !out.status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut cwd: Option<String> = None;
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix('n') {
-            cwd = Some(rest.to_string());
-            break;
-        }
-    }
-    let cwd = cwd?;
-    let path = std::path::PathBuf::from(cwd.clone());
-    let git = Command::new("git")
-        .args(["-C", &cwd, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok();
-    let name = if let Some(gitout) = git {
-        if gitout.status.success() {
-            let root = String::from_utf8_lossy(&gitout.stdout).trim().to_string();
-            std::path::PathBuf::from(root)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| {
-                    path.file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "(unknown)".into())
-                })
-        } else {
-            path.file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "(unknown)".into())
-        }
-    } else {
-        path.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "(unknown)".into())
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .map(std::path::PathBuf::from)
+}
+
+fn is_safe_path(path: &std::path::Path) -> bool {
+    // Resolve to canonical path to prevent traversal attacks
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
     };
-    Some(ProjectInfo { name, path })
+    // Allow paths under home directory
+    if let Ok(home) = std::env::var("HOME")
+        && canonical.starts_with(&home)
+    {
+        return true;
+    }
+    // Allow /tmp and /var/folders (macOS temp)
+    // Note: On macOS, /tmp -> /private/tmp and /var -> /private/var after canonicalization
+    if canonical.starts_with("/tmp")
+        || canonical.starts_with("/private/tmp")
+        || canonical.starts_with("/var/folders")
+        || canonical.starts_with("/private/var/folders")
+    {
+        return true;
+    }
+    false
+}
+
+fn get_git_repo_name(path: &std::path::Path) -> Option<String> {
+    let out = Command::new("git")
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--show-toplevel",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout);
+    std::path::Path::new(root.trim())
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+}
+
+fn dir_name(path: &std::path::Path) -> Option<String> {
+    path.file_name().map(|s| s.to_string_lossy().to_string())
 }
 
 // docker/brew integrations moved to crate::integrations::{docker,brew}

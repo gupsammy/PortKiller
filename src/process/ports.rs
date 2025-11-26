@@ -62,6 +62,31 @@ pub fn scan_ports(port_ranges: &[(u16, u16)]) -> Result<Vec<ProcessInfo>> {
     Ok(results)
 }
 
+/// Verify that a PID is still associated with a TCP listener.
+/// Used to mitigate TOCTOU race conditions before killing a process.
+pub fn verify_pid_is_listener(pid: i32) -> bool {
+    let output = Command::new("lsof")
+        .args([
+            "-nP",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-Fn",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            // If lsof returns any "n" lines, PID is still listening
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.starts_with('n'))
+        }
+        _ => false,
+    }
+}
+
 // Extract a port number from an lsof name field.
 // Handles "*:3000", "127.0.0.1:5173", and "[::1]:8000".
 pub fn parse_port_from_lsof(name: &str) -> Option<u16> {
