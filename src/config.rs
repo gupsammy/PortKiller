@@ -129,6 +129,20 @@ fn ensure_secure_permissions(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Load and validate config from disk. Returns error if file doesn't exist or is invalid.
+/// Used by hot-reload (file watcher and manual reload).
+pub fn load_and_validate_config() -> Result<Config> {
+    let path = get_config_path();
+    if !path.exists() {
+        anyhow::bail!("config file does not exist");
+    }
+    ensure_secure_permissions(&path)?;
+    let content = fs::read_to_string(&path).context("failed to read config file")?;
+    let config: Config = serde_json::from_str(&content).context("failed to parse config file")?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
 fn validate_config(config: &Config) -> Result<()> {
     // Validate poll interval (1-300 seconds)
     if config.monitoring.poll_interval_secs == 0 || config.monitoring.poll_interval_secs > 300 {

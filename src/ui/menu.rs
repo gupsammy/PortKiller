@@ -11,6 +11,7 @@ const MENU_ID_DOCKER_STOP_ALL: &str = "docker_stop_all";
 const MENU_ID_BREW_STOP_ALL: &str = "brew_stop_all";
 const MENU_ID_QUIT: &str = "quit";
 const MENU_ID_EDIT_CONFIG: &str = "edit_config";
+const MENU_ID_RELOAD_CONFIG: &str = "reload_config";
 const MENU_ID_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const MENU_ID_PROCESS_PREFIX: &str = "process_";
 const MENU_ID_DOCKER_STOP_PREFIX: &str = "docker_stop_";
@@ -266,6 +267,9 @@ pub fn build_menu_with_context(state: &AppState) -> Result<Menu> {
     let edit_config_item =
         MenuItem::with_id(MENU_ID_EDIT_CONFIG, "Edit Configuration...", true, None);
     menu.append(&edit_config_item)?;
+    let reload_config_item =
+        MenuItem::with_id(MENU_ID_RELOAD_CONFIG, "Reload Configuration", true, None);
+    menu.append(&reload_config_item)?;
 
     // Add checkable Launch at Login item
     let launch_enabled = state.config.system.launch_at_login;
@@ -302,6 +306,8 @@ pub fn parse_menu_action(id: &MenuId) -> Option<crate::model::MenuAction> {
         Some(crate::model::MenuAction::Quit)
     } else if raw == MENU_ID_EDIT_CONFIG {
         Some(crate::model::MenuAction::EditConfig)
+    } else if raw == MENU_ID_RELOAD_CONFIG {
+        Some(crate::model::MenuAction::ReloadConfig)
     } else if raw == MENU_ID_LAUNCH_AT_LOGIN {
         Some(crate::model::MenuAction::LaunchAtLogin)
     } else if let Some(rest) = raw.strip_prefix(MENU_ID_DOCKER_STOP_PREFIX) {

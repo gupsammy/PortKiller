@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -7,12 +8,15 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use log::{error, warn};
 use nix::errno::Errno;
+use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::event::{Event, StartCause};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 
-use crate::config::{Config, get_config_path, load_or_create_config, save_config};
+use crate::config::{
+    get_config_path, load_and_validate_config, load_or_create_config, save_config,
+};
 use crate::integrations::brew::{query_brew_services_map, run_brew_stop};
 use crate::integrations::docker::{query_docker_port_map, run_docker_stop};
 use crate::model::*;
@@ -33,6 +37,7 @@ const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn run() -> Result<()> {
     let config = load_or_create_config().context("failed to load configuration")?;
+    let shared_config = Arc::new(RwLock::new(config.clone()));
 
     let mut state = AppState {
         processes: Vec::new(),
@@ -49,7 +54,8 @@ pub fn run() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let (worker_tx, worker_rx) = crossbeam_channel::unbounded();
 
-    let _monitor_thread = spawn_monitor_thread(proxy.clone(), config.clone());
+    let _monitor_thread = spawn_monitor_thread(proxy.clone(), shared_config.clone());
+    let _config_watcher = spawn_config_watcher(proxy.clone(), shared_config.clone());
     let _worker = spawn_worker(worker_rx, proxy.clone());
     let menu_receiver = MenuEvent::receiver().clone();
 
@@ -71,6 +77,8 @@ pub fn run() -> Result<()> {
     let mut worker_sender: Option<Sender<WorkerCommand>> = Some(worker_tx);
     // Initialize to past time to force first integration refresh
     let mut last_integration_refresh = Instant::now() - INTEGRATION_REFRESH_INTERVAL;
+    // Clone shared_config for use in event loop (for manual reload)
+    let shared_config_for_loop = shared_config.clone();
 
     #[allow(deprecated)]
     let run_result = event_loop.run(move |event, event_loop| match event {
@@ -343,6 +351,25 @@ pub fn run() -> Result<()> {
                         }
                     }
                 }
+                MenuAction::ReloadConfig => {
+                    match load_and_validate_config() {
+                        Ok(new_config) => {
+                            // Update shared config for monitor thread
+                            if let Ok(mut cfg) = shared_config_for_loop.write() {
+                                *cfg = new_config.clone();
+                            }
+                            state.config = new_config;
+                            state.last_feedback =
+                                Some(KillFeedback::info("Configuration reloaded".to_string()));
+                        }
+                        Err(e) => {
+                            state.last_feedback =
+                                Some(KillFeedback::error(format!("Reload failed: {}", e)));
+                        }
+                    }
+                    sync_menu_with_context(&tray_icon, &state);
+                    update_tray_display(&tray_icon, &state);
+                }
             },
             UserEvent::KillFeedback(feedback) => {
                 state.last_feedback = Some(feedback);
@@ -350,6 +377,17 @@ pub fn run() -> Result<()> {
             }
             UserEvent::MonitorError(message) => {
                 warn!("Monitor error: {}", message);
+                state.last_feedback = Some(KillFeedback::error(message));
+                update_tray_display(&tray_icon, &state);
+            }
+            UserEvent::ConfigReloaded(new_config) => {
+                state.config = new_config;
+                state.last_feedback =
+                    Some(KillFeedback::info("Configuration reloaded".to_string()));
+                sync_menu_with_context(&tray_icon, &state);
+                update_tray_display(&tray_icon, &state);
+            }
+            UserEvent::ConfigReloadFailed(message) => {
                 state.last_feedback = Some(KillFeedback::error(message));
                 update_tray_display(&tray_icon, &state);
             }
@@ -366,19 +404,25 @@ pub fn run() -> Result<()> {
 
 fn spawn_monitor_thread(
     proxy: EventLoopProxy<UserEvent>,
-    config: Config,
+    shared_config: Arc<RwLock<crate::config::Config>>,
 ) -> thread::JoinHandle<()> {
-    // Use config's poll interval, with idle being a multiple of it
-    let poll_interval_active = Duration::from_secs(config.monitoring.poll_interval_secs);
-    let poll_interval_idle =
-        Duration::from_secs(config.monitoring.poll_interval_secs * IDLE_MULTIPLIER);
-
     thread::spawn(move || {
         let mut previous: Vec<ProcessInfo> = Vec::new();
         let mut last_change = Instant::now();
         loop {
+            // Read current config at each iteration to pick up hot-reloaded changes
+            let (port_ranges, poll_interval_secs) = {
+                let cfg = shared_config.read().unwrap();
+                (
+                    cfg.monitoring.port_ranges.clone(),
+                    cfg.monitoring.poll_interval_secs,
+                )
+            };
+            let poll_interval_active = Duration::from_secs(poll_interval_secs);
+            let poll_interval_idle = Duration::from_secs(poll_interval_secs * IDLE_MULTIPLIER);
+
             let scan_start = Instant::now();
-            match scan_ports(&config.monitoring.port_ranges) {
+            match scan_ports(&port_ranges) {
                 Ok(mut processes) => {
                     let scan_duration = scan_start.elapsed();
                     processes.sort();
@@ -418,6 +462,77 @@ fn spawn_monitor_thread(
                         break;
                     }
                     thread::sleep(poll_interval_active);
+                }
+            }
+        }
+    })
+}
+
+const CONFIG_DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
+
+fn spawn_config_watcher(
+    proxy: EventLoopProxy<UserEvent>,
+    shared_config: Arc<RwLock<crate::config::Config>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let config_path = get_config_path();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let mut watcher: RecommendedWatcher = match Watcher::new(
+            move |res: Result<NotifyEvent, notify::Error>| {
+                let _ = tx.send(res);
+            },
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("Failed to create config watcher: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+            log::error!("Failed to watch config file: {}", e);
+            return;
+        }
+
+        log::debug!("Config watcher started for {:?}", config_path);
+
+        // Debounce: track last reload time
+        let mut last_reload = Instant::now() - CONFIG_DEBOUNCE_DURATION;
+
+        for result in rx {
+            match result {
+                Ok(event) => {
+                    // Only react to modify/create events
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                        // Debounce rapid changes (editors may write in multiple ops)
+                        if last_reload.elapsed() < CONFIG_DEBOUNCE_DURATION {
+                            continue;
+                        }
+                        last_reload = Instant::now();
+
+                        log::debug!("Config file changed, attempting reload");
+
+                        // Attempt to load and validate
+                        match load_and_validate_config() {
+                            Ok(new_config) => {
+                                // Update shared config for monitor thread
+                                if let Ok(mut cfg) = shared_config.write() {
+                                    *cfg = new_config.clone();
+                                }
+                                let _ = proxy.send_event(UserEvent::ConfigReloaded(new_config));
+                            }
+                            Err(e) => {
+                                let msg = format!("Config reload failed: {}", e);
+                                log::warn!("{}", msg);
+                                let _ = proxy.send_event(UserEvent::ConfigReloadFailed(msg));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Config watch error: {}", e);
                 }
             }
         }

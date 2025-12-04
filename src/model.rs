@@ -16,6 +16,8 @@ pub enum UserEvent {
     MenuAction(MenuAction),
     KillFeedback(KillFeedback),
     MonitorError(String),
+    ConfigReloaded(crate::config::Config),
+    ConfigReloadFailed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +29,7 @@ pub enum MenuAction {
     BrewStop { service: String },
     BrewStopAll,
     EditConfig,
+    ReloadConfig,
     LaunchAtLogin,
     Quit,
 }

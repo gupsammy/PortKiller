@@ -4,7 +4,7 @@ macOS menu bar app for monitoring and killing processes on development ports. Bu
 
 ## Tech Stack
 
-Rust 2024 edition, Cargo. Key deps: tray-icon, winit, nix, crossbeam-channel, anyhow, smappservice-rs (launch-at-login).
+Rust 2024 edition, Cargo. Key deps: tray-icon, winit, nix, crossbeam-channel, anyhow, smappservice-rs (launch-at-login), notify (file watching).
 
 ## Build Optimizations
 
@@ -66,7 +66,7 @@ src/
 ```
 
 ### Threading Model
-Four threads via channels: Main (winit event loop), Monitor (2s port polling), Menu Listener (click → action), Kill Worker (process termination).
+Five threads via channels: Main (winit event loop), Monitor (2s port polling), Menu Listener (click → action), Kill Worker (process termination), Config Watcher (hot-reload via FSEvents).
 
 ## Default Port Ranges
 
@@ -78,7 +78,7 @@ Poll every 2s, SIGTERM grace 2s, SIGKILL grace 1s, poll step 200ms, max 5 toolti
 
 ## Common Patterns
 
-Adding ports: Edit `~/.portkiller.json` (restart required). Defaults in `config.rs`.
+Adding ports: Edit `~/.portkiller.json` (changes apply automatically via hot-reload, or use "Reload Configuration" menu). Defaults in `config.rs`.
 New integrations: Add to `src/integrations/`, implement detection + port mapping + menu integration.
 Debugging: `RUST_LOG=debug cargo run` for lsof parsing, Docker/Brew discovery, kill sequence logs.
 
