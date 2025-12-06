@@ -83,3 +83,29 @@ fn notify_with_terminal_notifier(title: &str, body: &str) {
         ])
         .spawn();
 }
+
+/// Notify user that an update is available with clickable download link
+pub fn notify_update_available(version: &str, download_url: &str) {
+    let cmd = find_command("terminal-notifier");
+    if !std::path::Path::new(cmd).exists() && Command::new(cmd).arg("-help").output().is_err() {
+        return;
+    }
+
+    let title = format!("PortKiller v{} Available", version);
+    let body = "Click to download the update";
+
+    let _ = Command::new(cmd)
+        .args([
+            "-title",
+            &title,
+            "-message",
+            body,
+            "-sender",
+            BUNDLE_ID,
+            "-sound",
+            "Glass",
+            "-open",
+            download_url,
+        ])
+        .spawn();
+}

@@ -13,6 +13,10 @@ const MENU_ID_QUIT: &str = "quit";
 const MENU_ID_EDIT_CONFIG: &str = "edit_config";
 const MENU_ID_RELOAD_CONFIG: &str = "reload_config";
 const MENU_ID_LAUNCH_AT_LOGIN: &str = "launch_at_login";
+const MENU_ID_CHECK_FOR_UPDATES: &str = "check_for_updates";
+const MENU_ID_TOGGLE_AUTO_UPDATE: &str = "toggle_auto_update";
+const MENU_ID_DOWNLOAD_UPDATE: &str = "download_update";
+const MENU_ID_DISMISS_UPDATE: &str = "dismiss_update";
 const MENU_ID_PROCESS_PREFIX: &str = "process_";
 const MENU_ID_DOCKER_STOP_PREFIX: &str = "docker_stop_";
 const MENU_ID_BREW_STOP_PREFIX: &str = "brew_stop_";
@@ -285,6 +289,31 @@ pub fn build_menu_with_context(state: &AppState) -> Result<Menu> {
     );
     menu.append(&launch_item)?;
 
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    // Update section
+    if let Some(ref update) = state.available_update {
+        let download_label = format!("Download Update (v{})", update.version);
+        let download_item = MenuItem::with_id(MENU_ID_DOWNLOAD_UPDATE, download_label, true, None);
+        menu.append(&download_item)?;
+    }
+
+    let check_item = MenuItem::with_id(MENU_ID_CHECK_FOR_UPDATES, "Check for Updates", true, None);
+    menu.append(&check_item)?;
+
+    let auto_check_enabled = state.config.updates.check_enabled;
+    let auto_check_item = MenuItem::with_id(
+        MENU_ID_TOGGLE_AUTO_UPDATE,
+        if auto_check_enabled {
+            "✓ Auto-check for Updates"
+        } else {
+            "Auto-check for Updates"
+        },
+        true,
+        None,
+    );
+    menu.append(&auto_check_item)?;
+
     let quit_item = MenuItem::with_id(MENU_ID_QUIT, "Quit", true, None);
     menu.append(&quit_item)?;
     Ok(menu)
@@ -310,6 +339,14 @@ pub fn parse_menu_action(id: &MenuId) -> Option<crate::model::MenuAction> {
         Some(crate::model::MenuAction::ReloadConfig)
     } else if raw == MENU_ID_LAUNCH_AT_LOGIN {
         Some(crate::model::MenuAction::LaunchAtLogin)
+    } else if raw == MENU_ID_CHECK_FOR_UPDATES {
+        Some(crate::model::MenuAction::CheckForUpdates)
+    } else if raw == MENU_ID_TOGGLE_AUTO_UPDATE {
+        Some(crate::model::MenuAction::ToggleAutoUpdate)
+    } else if raw == MENU_ID_DOWNLOAD_UPDATE {
+        Some(crate::model::MenuAction::DownloadUpdate)
+    } else if raw == MENU_ID_DISMISS_UPDATE {
+        Some(crate::model::MenuAction::DismissUpdate)
     } else if let Some(rest) = raw.strip_prefix(MENU_ID_DOCKER_STOP_PREFIX) {
         Some(crate::model::MenuAction::DockerStop {
             container: sanitize_identifier(rest),

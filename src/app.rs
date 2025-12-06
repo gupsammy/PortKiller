@@ -20,7 +20,7 @@ use crate::config::{
 use crate::integrations::brew::{query_brew_services_map, run_brew_stop};
 use crate::integrations::docker::{query_docker_port_map, run_docker_stop};
 use crate::model::*;
-use crate::notify::maybe_notify_changes;
+use crate::notify::{maybe_notify_changes, notify_update_available};
 use crate::process::kill::terminate_pid;
 use crate::process::ports::scan_ports;
 use crate::ui::icon::{IconVariant, create_template_icon};
@@ -28,11 +28,15 @@ use crate::ui::menu::{
     build_menu_with_context, build_tooltip, collect_targets_for_all, format_command_label,
     parse_menu_action,
 };
+use crate::update::check_for_update;
 
 const IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 const IDLE_MULTIPLIER: u64 = 2; // Idle poll interval = base * IDLE_MULTIPLIER
 const INTEGRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const UPDATE_CHECK_DELAY: Duration = Duration::from_secs(5);
+const DOWNLOAD_URL: &str =
+    "https://github.com/gupsammy/PortKiller/releases/latest/download/PortKiller.dmg";
 // menu constants moved under ui::menu
 
 pub fn run() -> Result<()> {
@@ -46,6 +50,7 @@ pub fn run() -> Result<()> {
         project_cache: HashMap::new(),
         docker_port_map: HashMap::new(),
         brew_services_map: HashMap::new(),
+        available_update: None,
     };
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
@@ -57,6 +62,7 @@ pub fn run() -> Result<()> {
     let _monitor_thread = spawn_monitor_thread(proxy.clone(), shared_config.clone());
     let _config_watcher = spawn_config_watcher(proxy.clone(), shared_config.clone());
     let _worker = spawn_worker(worker_rx, proxy.clone());
+    let _update_checker = spawn_update_checker(proxy.clone(), shared_config.clone());
     let menu_receiver = MenuEvent::receiver().clone();
 
     let icon =
@@ -370,6 +376,61 @@ pub fn run() -> Result<()> {
                     sync_menu_with_context(&tray_icon, &state);
                     update_tray_display(&tray_icon, &state);
                 }
+                MenuAction::CheckForUpdates => {
+                    state.last_feedback =
+                        Some(KillFeedback::info("Checking for updates...".to_string()));
+                    update_tray_display(&tray_icon, &state);
+
+                    // Spawn a thread to check for updates
+                    let proxy_clone = proxy.clone();
+                    thread::spawn(move || {
+                        let result = check_for_update().ok().flatten();
+                        let _ = proxy_clone.send_event(UserEvent::UpdateCheckResult(result));
+                    });
+                }
+                MenuAction::ToggleAutoUpdate => {
+                    state.config.updates.check_enabled = !state.config.updates.check_enabled;
+                    if let Err(e) = save_config(&state.config) {
+                        state.last_feedback =
+                            Some(KillFeedback::error(format!("Failed to save config: {}", e)));
+                    } else {
+                        state.last_feedback =
+                            Some(KillFeedback::info(if state.config.updates.check_enabled {
+                                "Auto-update check enabled".to_string()
+                            } else {
+                                "Auto-update check disabled".to_string()
+                            }));
+                    }
+                    // Update shared config
+                    if let Ok(mut cfg) = shared_config_for_loop.write() {
+                        *cfg = state.config.clone();
+                    }
+                    sync_menu_with_context(&tray_icon, &state);
+                    update_tray_display(&tray_icon, &state);
+                }
+                MenuAction::DownloadUpdate => {
+                    if state.available_update.is_some() {
+                        let _ = Command::new("open").arg(DOWNLOAD_URL).spawn();
+                        state.last_feedback =
+                            Some(KillFeedback::info("Opening download...".to_string()));
+                    }
+                    update_tray_display(&tray_icon, &state);
+                }
+                MenuAction::DismissUpdate => {
+                    if let Some(ref update_info) = state.available_update {
+                        state.config.updates.dismissed_version = Some(update_info.version.clone());
+                        let _ = save_config(&state.config);
+                        state.available_update = None;
+                        state.last_feedback =
+                            Some(KillFeedback::info("Update dismissed".to_string()));
+                        // Update shared config
+                        if let Ok(mut cfg) = shared_config_for_loop.write() {
+                            *cfg = state.config.clone();
+                        }
+                    }
+                    sync_menu_with_context(&tray_icon, &state);
+                    update_tray_display(&tray_icon, &state);
+                }
             },
             UserEvent::KillFeedback(feedback) => {
                 state.last_feedback = Some(feedback);
@@ -389,6 +450,31 @@ pub fn run() -> Result<()> {
             }
             UserEvent::ConfigReloadFailed(message) => {
                 state.last_feedback = Some(KillFeedback::error(message));
+                update_tray_display(&tray_icon, &state);
+            }
+            UserEvent::UpdateCheckResult(result) => {
+                if let Some(ref update_info) = result {
+                    // Check if this version was dismissed
+                    let dismissed = state
+                        .config
+                        .updates
+                        .dismissed_version
+                        .as_ref()
+                        .map(|v| v == &update_info.version)
+                        .unwrap_or(false);
+
+                    if !dismissed {
+                        state.available_update = result.clone();
+                        notify_update_available(&update_info.version, &update_info.download_url);
+                        state.last_feedback = Some(KillFeedback::info(format!(
+                            "Update available: v{}",
+                            update_info.version
+                        )));
+                    }
+                } else {
+                    state.available_update = None;
+                }
+                sync_menu_with_context(&tray_icon, &state);
                 update_tray_display(&tray_icon, &state);
             }
         },
@@ -469,6 +555,85 @@ fn spawn_monitor_thread(
 }
 
 const CONFIG_DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
+
+fn spawn_update_checker(
+    proxy: EventLoopProxy<UserEvent>,
+    shared_config: Arc<RwLock<crate::config::Config>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Initial delay before first check
+        thread::sleep(UPDATE_CHECK_DELAY);
+
+        loop {
+            // Read config to check if updates are enabled
+            let (check_enabled, check_interval_hours, last_check, dismissed_version) = {
+                let cfg = shared_config.read().unwrap();
+                (
+                    cfg.updates.check_enabled,
+                    cfg.updates.check_interval_hours,
+                    cfg.updates.last_check_timestamp,
+                    cfg.updates.dismissed_version.clone(),
+                )
+            };
+
+            if !check_enabled {
+                // Sleep for an hour and check again if enabled
+                thread::sleep(Duration::from_secs(3600));
+                continue;
+            }
+
+            // Check if enough time has passed since last check
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let should_check = match last_check {
+                Some(last) => now - last >= (check_interval_hours as i64 * 3600),
+                None => true,
+            };
+
+            if should_check {
+                log::debug!("Performing scheduled update check");
+                match check_for_update() {
+                    Ok(Some(update_info)) => {
+                        // Check if dismissed
+                        let is_dismissed = dismissed_version
+                            .as_ref()
+                            .map(|v| v == &update_info.version)
+                            .unwrap_or(false);
+
+                        if !is_dismissed {
+                            let _ =
+                                proxy.send_event(UserEvent::UpdateCheckResult(Some(update_info)));
+                        }
+
+                        // Update last check timestamp
+                        if let Ok(mut cfg) = shared_config.write() {
+                            cfg.updates.last_check_timestamp = Some(now);
+                            let _ = save_config(&cfg);
+                        }
+                    }
+                    Ok(None) => {
+                        log::debug!("No update available");
+                        // Update last check timestamp
+                        if let Ok(mut cfg) = shared_config.write() {
+                            cfg.updates.last_check_timestamp = Some(now);
+                            let _ = save_config(&cfg);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Update check failed: {}", e);
+                        // Don't update timestamp on failure, retry next interval
+                    }
+                }
+            }
+
+            // Sleep for the configured interval
+            thread::sleep(Duration::from_secs(check_interval_hours * 3600));
+        }
+    })
+}
 
 fn spawn_config_watcher(
     proxy: EventLoopProxy<UserEvent>,
