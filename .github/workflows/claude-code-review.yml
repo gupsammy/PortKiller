@@ -94,4 +94,6 @@ jobs:
 
           # Tools for comprehensive review with inline comments and gh CLI
           claude_args: |
+            --model opus
+            --effort high
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh:*), Bash(cargo:*)"
